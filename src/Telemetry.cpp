@@ -31,6 +31,11 @@ void Telemetry::update(float dt, const glm::vec2& position, float speed, float s
     float longitudinalForceFactor = (throttle + brake) * std::abs(speed);
     float tempIncrease = (lateralForceFactor + longitudinalForceFactor) * 0.01f;
     tireTempC += tempIncrease - (tireTempC - 20.0f) * 0.001f; // Natural cooling
+
+    trajectory.push_back(position);
+    if (trajectory.size() > maxTrajectoryPoints) {
+        trajectory.erase(trajectory.begin());
+    }
 }
 
 void Telemetry::reset() {
@@ -47,4 +52,6 @@ void Telemetry::reset() {
     // Reset other values
     tireTempC = 20.0f;
     totalDistance = 0.0f;
+
+    trajectory.clear();
 }

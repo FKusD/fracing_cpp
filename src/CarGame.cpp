@@ -1,6 +1,7 @@
 #include "../include/CarGame.h"
 #include "../include/Car.h"
 #include "../include/Telemetry.h"
+#include "../include/Track.h"
 
 // GLAD для OpenGL
 #include <glad/gl.h>
@@ -354,8 +355,9 @@ ImGuiHud& hud() {
 } // namespace
 
 CarGame::CarGame()
-    : world(nullptr), gravity(0.0f, 0.0f), car(nullptr), telemetry(nullptr),
-      window(nullptr), accumulator(0.0f), showHud(true), showPhysics(true) {
+    : world(nullptr), gravity(0.0f, 0.0f), car(nullptr), telemetry(nullptr), track(nullptr),
+      window(nullptr), accumulator(0.0f), showHud(true), showPhysics(true), showTrajectory(true),
+      trackPath("assets/default_track.json") {
 }
 
 CarGame::~CarGame() {
@@ -370,15 +372,24 @@ bool CarGame::initialize() {
     projection = glm::ortho(-VIEW_W/2, VIEW_W/2, -VIEW_H/2, VIEW_H/2, -1.0f, 1.0f);
     cameraPos = glm::vec3(0.0f, 0.0f, 0.0f);
 
-    // Create car at origin
-    car = std::make_unique<Car>(world, glm::vec2(0.0f, 0.0f));
+    // Load track (data) and build collision
+    const bool trackOk = loadTrack();
+    if (trackOk) {
+        buildTrackCollision();
+    } else {
+        // Fallback: hardcoded arena
+        createArenaBounds();
+        createObstacles();
+    }
+
+    // Create car at spawn
+    const glm::vec2 spawnPos = (trackOk && track) ? track->spawnPos : glm::vec2(0.0f, 0.0f);
+    const float spawnYawRad = (trackOk && track) ? track->spawnYawRad : 0.0f;
+    car = std::make_unique<Car>(world, spawnPos);
+    car->reset(spawnPos, spawnYawRad);
 
     // Create telemetry system
     telemetry = std::make_unique<Telemetry>();
-
-    // Create arena bounds and obstacles
-    createArenaBounds();
-    createObstacles();
 
     // Включаем Box2D debug draw (контуры тел/джойнтов)
     box2dDebugDraw().SetFlags(
@@ -443,6 +454,19 @@ void CarGame::render() {
         renderer().draw();
     }
 
+    // Trajectory (telemetry)
+    if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
+        debugRenderer().beginFrame();
+        const auto& tr = telemetry->trajectory;
+        for (size_t i = 1; i < tr.size(); ++i) {
+            const glm::vec2& a = tr[i - 1];
+            const glm::vec2& b = tr[i];
+            debugRenderer().addLine(b2Vec2(a.x, a.y), b2Vec2(b.x, b.y));
+        }
+        debugRenderer().flush(projection, 1.0f, 0.7f, 0.15f, 0.65f);
+        debugRenderer().beginFrame();
+    }
+
     // HUD поверх мира
     if (showHud) {
         hud().newFrame();
@@ -477,8 +501,14 @@ void CarGame::render() {
         ImGui::Separator();
         ImGui::Checkbox("Show physics (F2)", &showPhysics);
         ImGui::Checkbox("Show HUD (F1)", &showHud);
+        ImGui::Checkbox("Show trajectory", &showTrajectory);
+        if (telemetry) {
+            ImGui::SliderInt("Trajectory points", &telemetry->maxTrajectoryPoints, 50, 20000);
+        }
         if (ImGui::Button("Reset (R)")) {
-            if (car) car->reset(glm::vec2(0.0f, 0.0f));
+            const glm::vec2 spawnPos = (track ? track->spawnPos : glm::vec2(0.0f, 0.0f));
+            const float spawnYawRad = (track ? track->spawnYawRad : 0.0f);
+            if (car) car->reset(spawnPos, spawnYawRad);
             if (telemetry) telemetry->reset();
         }
         ImGui::End();
@@ -545,7 +575,9 @@ void CarGame::handleInput() {
     static bool rPressed = false;
     bool rCurrentlyPressed = glfwGetKey(currentWindow, GLFW_KEY_R) == GLFW_PRESS;
     if (rCurrentlyPressed && !rPressed) {
-        car->reset(glm::vec2(0.0f, 0.0f));
+        const glm::vec2 spawnPos = (track ? track->spawnPos : glm::vec2(0.0f, 0.0f));
+        const float spawnYawRad = (track ? track->spawnYawRad : 0.0f);
+        car->reset(spawnPos, spawnYawRad);
         telemetry->reset();
     }
     rPressed = rCurrentlyPressed;
@@ -560,12 +592,73 @@ void CarGame::shutdown() {
     hud().shutdown();
 
     if (world) {
+        clearTrackCollision();
         delete world;
         world = nullptr;
     }
 
     car.reset();
     telemetry.reset();
+    track.reset();
+}
+
+bool CarGame::loadTrack() {
+    track = std::make_unique<Track>();
+    std::string err;
+    if (!loadTrackFromFile(trackPath, *track, &err)) {
+        std::cerr << "Failed to load track from '" << trackPath << "': " << err << std::endl;
+        track.reset();
+        return false;
+    }
+    return true;
+}
+
+void CarGame::clearTrackCollision() {
+    if (!world) return;
+    for (b2Body* b : trackBodies) {
+        if (b) world->DestroyBody(b);
+    }
+    trackBodies.clear();
+}
+
+void CarGame::buildTrackCollision() {
+    if (!world) return;
+    clearTrackCollision();
+    if (!track) return;
+
+    for (const WallSegment& wall : track->walls) {
+        if (wall.vertices.size() < 2) continue;
+
+        const float halfThickness = std::max(wall.thickness, 0.01f);
+        for (size_t i = 0; i + 1 < wall.vertices.size(); ++i) {
+            const glm::vec2 a = wall.vertices[i];
+            const glm::vec2 b = wall.vertices[i + 1];
+            const glm::vec2 d = b - a;
+            const float len = glm::length(d);
+            if (len < 1e-4f) continue;
+
+            const glm::vec2 center = (a + b) * 0.5f;
+            const float angleRad = std::atan2(d.y, d.x);
+
+            b2BodyDef bd;
+            bd.type = b2_staticBody;
+            bd.position.Set(center.x, center.y);
+            bd.angle = angleRad;
+
+            b2Body* body = world->CreateBody(&bd);
+
+            b2PolygonShape shape;
+            shape.SetAsBox(len * 0.5f, halfThickness);
+
+            b2FixtureDef fd;
+            fd.shape = &shape;
+            fd.friction = wall.friction;
+            fd.restitution = wall.restitution;
+            body->CreateFixture(&fd);
+
+            trackBodies.push_back(body);
+        }
+    }
 }
 
 void CarGame::createArenaBounds() {

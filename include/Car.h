@@ -16,6 +16,7 @@ public:
     void fixedUpdate(float dt);
 
     void reset(const glm::vec2& pos);
+    void reset(const glm::vec2& pos, float yawRad);
 
     glm::vec2 getPosition() const;
     float getAngleRad() const;

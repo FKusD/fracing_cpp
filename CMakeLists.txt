@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
+# nlohmann/json (header-only)
+FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # GLFW
 FetchContent_Declare(
         glfw
@@ -58,6 +66,7 @@ add_executable(fracing_cpp
         src/Car.cpp
         src/VehicleModel.cpp
         src/Telemetry.cpp
+        src/Track.cpp
 )
 
 add_library(glad STATIC
@@ -96,6 +105,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         glm::glm
         glad
         imgui_lib
+        nlohmann_json::nlohmann_json
 )
 
 if(MSVC)

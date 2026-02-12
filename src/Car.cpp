@@ -4,6 +4,8 @@
 Car::Car(b2World* world, const glm::vec2& startPos)
     : world(world), body(nullptr), muSurface(params.muAsphalt) {
     state.pos = startPos;
+    state.yawRad = 0.0f;
+    state.v = 0.0f;
     createBody(startPos);
 }
 
@@ -42,12 +44,16 @@ void Car::fixedUpdate(float dt) {
 }
 
 void Car::reset(const glm::vec2& pos) {
+    reset(pos, 0.0f);
+}
+
+void Car::reset(const glm::vec2& pos, float yawRad) {
     if (body) {
         world->DestroyBody(body);
     }
 
     state.pos = pos;
-    state.yawRad = 0.0f;
+    state.yawRad = yawRad;
     state.v = 0.0f;
 
     createBody(pos);

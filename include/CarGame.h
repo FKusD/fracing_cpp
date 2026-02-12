@@ -11,6 +11,7 @@ struct GLFWwindow;
 class Car;
 class PhysicsWorld;
 class Telemetry;
+struct Track;
 
 class CarGame {
 public:
@@ -34,6 +35,8 @@ private:
     b2Vec2 gravity;
     std::unique_ptr<Car> car;
     std::unique_ptr<Telemetry> telemetry;
+    std::unique_ptr<Track> track;
+    std::vector<b2Body*> trackBodies;
 
     GLFWwindow* window;
 
@@ -50,10 +53,15 @@ private:
     // Rendering flags
     bool showHud;
     bool showPhysics;
+    bool showTrajectory;
+    std::string trackPath;
 
     void createArenaBounds();
     void createObstacles();
     void createWallBox(const glm::vec2& center, float hx, float hy, float angleRad);
+    bool loadTrack();
+    void clearTrackCollision();
+    void buildTrackCollision();
     void updateCamera();
     void renderHud();
     void renderTrackBackground();

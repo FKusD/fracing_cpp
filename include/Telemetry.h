@@ -1,9 +1,14 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include <vector>
 
 class Telemetry {
 public:
+
+    std::vector<glm::vec2> trajectory;  // Last positions
+    int maxTrajectoryPoints = 1000;
+
     Telemetry();
     ~Telemetry();
 
