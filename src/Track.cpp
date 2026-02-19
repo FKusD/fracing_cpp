@@ -16,6 +16,7 @@ void Track::toJson(nlohmann::json& j) const {
     j["surfaces"] = surfaces;
     j["spawnPos"] = spawnPos;
     j["spawnYawRad"] = spawnYawRad;
+    j["arenaHalfExtents"] = arenaHalfExtents;
 }
 
 void Track::fromJson(const nlohmann::json& j) {
@@ -26,6 +27,7 @@ void Track::fromJson(const nlohmann::json& j) {
     surfaces = j["surfaces"];
     spawnPos = j["spawnPos"];
     spawnYawRad = j["spawnYawRad"];
+    arenaHalfExtents = j.value("arenaHalfExtents", glm::vec2(60.0f, 60.0f));
 }
 
 static std::string readAllTextFile(const std::string& path) {

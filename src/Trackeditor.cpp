@@ -1,4 +1,5 @@
 #include "TrackEditor.h"
+#include "DebugRenderer.h"
 #include <imgui.h>
 #include <algorithm>
 #include <cmath>
@@ -365,9 +366,7 @@ void TrackEditor::render() {
 }
 
 void TrackEditor::renderGrid() {
-    // TODO: Реализовать через ваш DebugLineRenderer
-    // Псевдокод:
-    /*
+
     float range = 50.0f;
     for (float x = -range; x <= range; x += gridSize) {
         debugRenderer().addLine(
@@ -381,16 +380,14 @@ void TrackEditor::renderGrid() {
             b2Vec2(range, y)
         );
     }
-    debugRenderer().flush(projection, 0.2f, 0.2f, 0.2f, 0.3f);
-    */
+    debugRenderer().flush(projectionMatrix, 0.2f, 0.2f, 0.2f, 0.3f);
+
 }
 
 void TrackEditor::renderCurrentWall() {
     if (currentWallPoints.empty()) return;
-    
-    // TODO: Рисуем линии между точками текущей стены
     // Цвет: зеленый (незавершенная стена)
-    /*
+
     for (size_t i = 0; i + 1 < currentWallPoints.size(); i++) {
         debugRenderer().addLine(
             b2Vec2(currentWallPoints[i].x, currentWallPoints[i].y),
@@ -404,8 +401,8 @@ void TrackEditor::renderCurrentWall() {
             b2Vec2(mouseWorldPos.x, mouseWorldPos.y)
         );
     }
-    debugRenderer().flush(projection, 0.0f, 1.0f, 0.0f, 1.0f);
-    */
+    debugRenderer().flush(projectionMatrix, 0.0f, 1.0f, 0.0f, 1.0f);
+
 }
 
 void TrackEditor::renderCurrentSurface() {
@@ -415,40 +412,42 @@ void TrackEditor::renderCurrentSurface() {
 void TrackEditor::renderWalls() {
     if (!currentTrack) return;
     
-    // TODO: Рисуем все существующие стены
-    /*
+    debugRenderer().beginFrame(); // Очищаем буфер линий для этого кадра
+
     for (const auto& wall : currentTrack->walls) {
         for (size_t i = 0; i + 1 < wall.vertices.size(); i++) {
-            debugRenderer().addLine(
-                b2Vec2(wall.vertices[i].x, wall.vertices[i].y),
-                b2Vec2(wall.vertices[i+1].x, wall.vertices[i+1].y)
-            );
+            if (currentRenderMode == RenderMode::SIMPLE_BOXES) {
+                // ШАГ 4 В ДЕЙСТВИИ: Рисуем объемные стены
+                debugRenderer().addRect(wall.vertices[i], wall.vertices[i+1], wall.thickness);
+            } else {
+                // Просто тонкие линии для режима текстур (пока нет текстур)
+                debugRenderer().addLine(
+                    b2Vec2(wall.vertices[i].x, wall.vertices[i].y),
+                    b2Vec2(wall.vertices[i+1].x, wall.vertices[i+1].y)
+                );
+            }
         }
-        debugRenderer().flush(projection, 1.0f, 1.0f, 1.0f, 1.0f);
     }
-    */
+    // Выводим на экран
+    debugRenderer().flush(projectionMatrix, 1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 void TrackEditor::renderCheckpoints() {
     if (!currentTrack) return;
-    
-    // TODO: Рисуем чекпоинты как линии
-    /*
+
     for (const auto& cp : currentTrack->checkpoints) {
         debugRenderer().addLine(
             b2Vec2(cp.start.x, cp.start.y),
             b2Vec2(cp.end.x, cp.end.y)
         );
-        debugRenderer().flush(projection, 1.0f, 1.0f, 0.0f, 1.0f); // Желтый
+        debugRenderer().flush(projectionMatrix, 1.0f, 1.0f, 0.0f, 1.0f); // Желтый
     }
-    */
+
 }
 
 void TrackEditor::renderSpawnPoint() {
     if (!currentTrack) return;
-    
-    // TODO: Рисуем стартовую точку как крестик или стрелку
-    /*
+
     glm::vec2 pos = currentTrack->spawnPos;
     float size = 1.0f;
     
@@ -470,8 +469,8 @@ void TrackEditor::renderSpawnPoint() {
         b2Vec2(pos.x + dir.x * 2.0f, pos.y + dir.y * 2.0f)
     );
     
-    debugRenderer().flush(projection, 0.0f, 1.0f, 1.0f, 1.0f); // Cyan
-    */
+    debugRenderer().flush(projectionMatrix, 0.0f, 1.0f, 1.0f, 1.0f); // Cyan
+
 }
 
 void TrackEditor::renderSurfaces() {
@@ -479,8 +478,7 @@ void TrackEditor::renderSurfaces() {
 }
 
 void TrackEditor::renderMouseCursor() {
-    // TODO: Рисуем курсор в мировых координатах
-    /*
+
     glm::vec2 pos = snapToGridIfNeeded(mouseWorldPos);
     float size = 0.2f;
     
@@ -492,8 +490,8 @@ void TrackEditor::renderMouseCursor() {
         b2Vec2(pos.x, pos.y - size),
         b2Vec2(pos.x, pos.y + size)
     );
-    debugRenderer().flush(projection, 1.0f, 0.0f, 0.0f, 1.0f); // Красный
-    */
+    debugRenderer().flush(projectionMatrix, 1.0f, 0.0f, 0.0f, 1.0f); // Красный
+
 }
 
 // =============================================================================
@@ -502,7 +500,17 @@ void TrackEditor::renderMouseCursor() {
 
 void TrackEditor::renderUI() {
     if (!isEditing()) return;
-    
+
+    ImGui::Separator();
+    ImGui::Text("Visual Style:");
+    if (ImGui::RadioButton("Boxes (Dev)", currentRenderMode == RenderMode::SIMPLE_BOXES)) {
+        currentRenderMode = RenderMode::SIMPLE_BOXES;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Textured", currentRenderMode == RenderMode::TEXTURED)) {
+        currentRenderMode = RenderMode::TEXTURED;
+    }
+
     renderMainToolbar();
     renderPropertiesWindow();
     renderObjectsList();
@@ -594,7 +602,28 @@ void TrackEditor::renderMainToolbar() {
 
 void TrackEditor::renderPropertiesWindow() {
     ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    
+
+    if (currentTrack) {
+        ImGui::Separator();
+        ImGui::Text("Track Size (Arena Bounds):");
+
+        glm::vec2 half = currentTrack->arenaHalfExtents;
+
+        // удобнее редактировать как Width/Height
+        float sizeWH[2] = { half.x * 2.0f, half.y * 2.0f };
+
+        if (ImGui::InputFloat2("Size (W,H)", sizeWH)) {
+            // защита от мусора/нулей
+            sizeWH[0] = std::max(2.0f, sizeWH[0]);
+            sizeWH[1] = std::max(2.0f, sizeWH[1]);
+
+            currentTrack->arenaHalfExtents = glm::vec2(sizeWH[0] * 0.5f, sizeWH[1] * 0.5f);
+            addHistoryState("Resize arena");
+            isDirty = true;
+        }
+    }
+
+
     if (mode == EditorMode::EDIT_WALLS) {
         ImGui::Text("Wall Properties:");
         ImGui::SliderFloat("Thickness", &currentWallThickness, 0.1f, 3.0f);

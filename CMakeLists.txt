@@ -69,6 +69,9 @@ add_executable(fracing_cpp
         src/Track.cpp
         src/Trackeditor.cpp
         include/Trackeditor.h
+        include/WorldRenderer.h
+        include/DebugRenderer.h
+        src/DebugRenderer.cpp
 )
 
 add_library(glad STATIC

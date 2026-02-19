@@ -22,6 +22,7 @@
 #include <cstring>
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include "DebugRenderer.h"
 
 namespace {
 GLuint compileShader(GLenum type, const char* src) {
@@ -90,7 +91,7 @@ struct SimpleRenderer {
 
         const char* vsSrc = R"GLSL(
             #version 330 core
-            layout(location = 0) in vec2 aPos;
+            layout(loion = 0) in vec2 aPos;
             void main() {
                 gl_Position = vec4(aPos, 0.0, 1.0);
             }
@@ -143,99 +144,99 @@ struct SimpleRenderer {
 //     return r;
 // }
 
-struct DebugLineRenderer {
-    GLuint vao = 0;
-    GLuint vbo = 0;
-    GLuint program = 0;
-    GLint uColor = -1;
-    GLint uMVP = -1;
-    bool initialized = false;
-
-    // (x,y) pairs
-    std::vector<float> vertices;
-
-    void initOnce() {
-        if (initialized) return;
-        initialized = true;
-
-        glGenVertexArrays(1, &vao);
-        glBindVertexArray(vao);
-
-        glGenBuffers(1, &vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-
-        const char* vsSrc = R"GLSL(
-            #version 330 core
-            layout(location = 0) in vec2 aPos;
-            uniform mat4 uMVP;
-            void main() {
-                gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
-            }
-        )GLSL";
-
-        const char* fsSrc = R"GLSL(
-            #version 330 core
-            out vec4 FragColor;
-            uniform vec4 uColor;
-            void main() {
-                FragColor = uColor;
-            }
-        )GLSL";
-
-        GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-        GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-        if (!vs || !fs) return;
-
-        program = linkProgram(vs, fs);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
-        if (!program) return;
-
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-
-        uColor = glGetUniformLocation(program, "uColor");
-        uMVP = glGetUniformLocation(program, "uMVP");
-
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindVertexArray(0);
-    }
-
-    void beginFrame() {
-        vertices.clear();
-    }
-
-    void addLine(const b2Vec2& a, const b2Vec2& b) {
-        vertices.push_back(a.x);
-        vertices.push_back(a.y);
-        vertices.push_back(b.x);
-        vertices.push_back(b.y);
-    }
-
-    void flush(const glm::mat4& mvp, float r, float g, float b, float a = 1.0f) {
-        if (!initialized) initOnce();
-        if (!program || !vao) return;
-        if (vertices.empty()) return;
-
-        glUseProgram(program);
-        if (uMVP >= 0) glUniformMatrix4fv(uMVP, 1, GL_FALSE, glm::value_ptr(mvp));
-        if (uColor >= 0) glUniform4f(uColor, r, g, b, a);
-
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)), vertices.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size() / 2));
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindVertexArray(0);
-        glUseProgram(0);
-    }
-};
-
-DebugLineRenderer& debugRenderer() {
-    static DebugLineRenderer r;
-    return r;
-}
+// struct DebugLineRenderer {
+//     GLuint vao = 0;
+//     GLuint vbo = 0;
+//     GLuint program = 0;
+//     GLint uColor = -1;
+//     GLint uMVP = -1;
+//     bool initialized = false;
+//
+//     // (x,y) pairs
+//     std::vector<float> vertices;
+//
+//     void initOnce() {
+//         if (initialized) return;
+//         initialized = true;
+//
+//         glGenVertexArrays(1, &vao);
+//         glBindVertexArray(vao);
+//
+//         glGenBuffers(1, &vbo);
+//         glBindBuffer(GL_ARRAY_BUFFER, vbo);
+//         glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+//
+//         const char* vsSrc = R"GLSL(
+//             #version 330 core
+//             layout(location = 0) in vec2 aPos;
+//             uniform mat4 uMVP;
+//             void main() {
+//                 gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
+//             }
+//         )GLSL";
+//
+//         const char* fsSrc = R"GLSL(
+//             #version 330 core
+//             out vec4 FragColor;
+//             uniform vec4 uColor;
+//             void main() {
+//                 FragColor = uColor;
+//             }
+//         )GLSL";
+//
+//         GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
+//         GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
+//         if (!vs || !fs) return;
+//
+//         program = linkProgram(vs, fs);
+//         glDeleteShader(vs);
+//         glDeleteShader(fs);
+//         if (!program) return;
+//
+//         glEnableVertexAttribArray(0);
+//         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+//
+//         uColor = glGetUniformLocation(program, "uColor");
+//         uMVP = glGetUniformLocation(program, "uMVP");
+//
+//         glBindBuffer(GL_ARRAY_BUFFER, 0);
+//         glBindVertexArray(0);
+//     }
+//
+//     void beginFrame() {
+//         vertices.clear();
+//     }
+//
+//     void addLine(const b2Vec2& a, const b2Vec2& b) {
+//         vertices.push_back(a.x);
+//         vertices.push_back(a.y);
+//         vertices.push_back(b.x);
+//         vertices.push_back(b.y);
+//     }
+//
+//     void flush(const glm::mat4& mvp, float r, float g, float b, float a = 1.0f) {
+//         if (!initialized) initOnce();
+//         if (!program || !vao) return;
+//         if (vertices.empty()) return;
+//
+//         glUseProgram(program);
+//         if (uMVP >= 0) glUniformMatrix4fv(uMVP, 1, GL_FALSE, glm::value_ptr(mvp));
+//         if (uColor >= 0) glUniform4f(uColor, r, g, b, a);
+//
+//         glBindVertexArray(vao);
+//         glBindBuffer(GL_ARRAY_BUFFER, vbo);
+//         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)), vertices.data(), GL_DYNAMIC_DRAW);
+//         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size() / 2));
+//         glBindBuffer(GL_ARRAY_BUFFER, 0);
+//         glBindVertexArray(0);
+//         glUseProgram(0);
+//     }
+// };
+//
+// DebugLineRenderer& debugRenderer() {
+//     static DebugLineRenderer r;
+//     return r;
+// }
 
 struct Box2DDebugDraw final : public b2Draw {
     void DrawPolygon(const b2Vec2* vertices, int32 vertexCount, const b2Color& color) override {
@@ -427,7 +428,7 @@ bool CarGame::initialize() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Включаем клавиатуру
     ImGui_ImplGlfw_InitForOpenGL(window, true); // true - важно для обработки мыши
     ImGui_ImplOpenGL3_Init("#version 330 core");
-
+    debugRenderer().initOnce();
     return true;
 }
 
@@ -435,10 +436,33 @@ void CarGame::update(float deltaTime) {
     // if (ImGui::IsAnyItemHovered()) {
     //     std::cout << "Мышь над кнопкой!" << std::endl;
     // }
+
+    static bool wasEditing = false;
+    const bool nowEditing = (trackEditor && trackEditor->isEditing());
+
+    // Переход из редактора в игру
+    if (wasEditing && !nowEditing) {
+        buildTrackCollision();                 // <-- ключ
+        // if (car && track) {
+        //     car->reset(track->spawnPos, track->spawnYawRad); // чтобы не заспавниться внутри стены
+        // }
+    }
+    wasEditing = nowEditing;
+
     // Обновляем редактор
     if (trackEditor) {
         trackEditor->update(deltaTime);
     }
+
+    if (trackEditor && trackEditor->isEditing()) {
+        trackEditor->update(deltaTime);
+        return; // В режиме редактора физику не считаем
+    }
+
+    if (world->GetBodyCount() == 0) return;
+
+    world->Step(deltaTime, 8, 3);
+
     if (!trackEditor || !trackEditor->isEditing()) {
         // handleInput();
 
@@ -481,27 +505,29 @@ void CarGame::render() {
     glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+
+    debugRenderer().beginFrame();
     // 4. РЕНДЕР МИРА (Box2D и Траектория)
     renderTrackBackground();
     if (showPhysics) {
         box2dDebugDraw().currentMVP = projection;
-        debugRenderer().beginFrame();
+        // ВНИМАНИЕ: Убери beginFrame() из методов Box2DDebugDraw,
+        // иначе они будут затирать друг друга!
         world->DebugDraw();
     }
 
     if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
-        debugRenderer().beginFrame();
         const auto& tr = telemetry->trajectory;
         for (size_t i = 1; i < tr.size(); ++i) {
             debugRenderer().addLine(b2Vec2(tr[i-1].x, tr[i-1].y), b2Vec2(tr[i].x, tr[i].y));
         }
-        debugRenderer().flush(projection, 1.0f, 0.7f, 0.15f, 0.65f);
     }
+    // Сбрасываем накопленное (физику и траекторию) одним вызовом
+    debugRenderer().flush(projection, 1.0f, 1.0f, 1.0f, 1.0f);
 
     // 5. РЕНДЕР ГРАФИКИ РЕДАКТОРА (Линии, точки)
     if (trackEditor) {
         trackEditor->setProjectionMatrix(projection);
-        trackEditor->setViewportSize(fbw, fbh);
         trackEditor->render();
     }
 
@@ -546,11 +572,20 @@ void CarGame::handleInput() {
     // F3 - переключение режима редактора
     static bool f3Pressed = false;
     bool f3CurrentlyPressed = glfwGetKey(currentWindow, GLFW_KEY_F3) == GLFW_PRESS;
+    // Найди этот блок в handleInput():
     if (f3CurrentlyPressed && !f3Pressed && trackEditor) {
         if (trackEditor->getMode() == EditorMode::PLAY) {
             trackEditor->setMode(EditorMode::EDIT_WALLS);
         } else {
             trackEditor->setMode(EditorMode::PLAY);
+
+            // ПЕРЕСОБИРАЕМ ФИЗИКУ
+            buildTrackCollision();
+
+            // ТЕЛЕПОРТИРУЕМ МАШИНУ (чтобы она не застряла в стене)
+            if (car && track) {
+                car->reset(track->spawnPos, track->spawnYawRad);
+            }
         }
     }
     f3Pressed = f3CurrentlyPressed;
@@ -662,33 +697,39 @@ void CarGame::clearTrackCollision() {
 }
 
 void CarGame::buildTrackCollision() {
-    if (!world) return;
-    clearTrackCollision();
-    if (!track) return;
+    if (!world || !track) return;
 
-    for (const WallSegment& wall : track->walls) {
+    // 1. Сначала полностью удаляем старые тела из списка trackBodies
+    // (Эти тела мы храним в векторе trackBodies, чтобы знать, что удалять)
+    for (b2Body* b : trackBodies) {
+        if (b) world->DestroyBody(b);
+    }
+    trackBodies.clear();
+
+    // 2. Создаем физику заново из актуальных данных track->walls
+    for (const auto& wall : track->walls) {
         if (wall.vertices.size() < 2) continue;
 
-        const float halfThickness = std::max(wall.thickness, 0.01f);
+        // Каждая стена в редакторе — это набор сегментов
         for (size_t i = 0; i + 1 < wall.vertices.size(); ++i) {
             const glm::vec2 a = wall.vertices[i];
             const glm::vec2 b = wall.vertices[i + 1];
-            const glm::vec2 d = b - a;
-            const float len = glm::length(d);
-            if (len < 1e-4f) continue;
 
-            const glm::vec2 center = (a + b) * 0.5f;
-            const float angleRad = std::atan2(d.y, d.x);
+            glm::vec2 diff = b - a;
+            float len = glm::length(diff);
+            if (len < 0.001f) continue;
 
             b2BodyDef bd;
             bd.type = b2_staticBody;
-            bd.position.Set(center.x, center.y);
-            bd.angle = angleRad;
+            // Ставим тело в центр сегмента
+            bd.position.Set(a.x + diff.x * 0.5f, a.y + diff.y * 0.5f);
+            bd.angle = std::atan2(diff.y, diff.x);
 
             b2Body* body = world->CreateBody(&bd);
 
             b2PolygonShape shape;
-            shape.SetAsBox(len * 0.5f, halfThickness);
+            // Box2D принимает hx, hy (половину ширины и высоты)
+            shape.SetAsBox(len * 0.5f, wall.thickness * 0.5f);
 
             b2FixtureDef fd;
             fd.shape = &shape;
@@ -699,21 +740,36 @@ void CarGame::buildTrackCollision() {
             trackBodies.push_back(body);
         }
     }
+    std::cout << "[Physics] Rebuilt! Segments: " << trackBodies.size() << std::endl;
 }
 
 void CarGame::createArenaBounds() {
-    float half = 60.0f;
+    if (!world) return;
+
+    // удалить старые bounds, если уже были
+    if (arenaBoundsBody) {
+        world->DestroyBody(arenaBoundsBody);
+        arenaBoundsBody = nullptr;
+    }
+
+    float hx = 60.0f;
+    float hy = 60.0f;
+
+    if (track) {
+        hx = std::max(1.0f, track->arenaHalfExtents.x);
+        hy = std::max(1.0f, track->arenaHalfExtents.y);
+    }
 
     b2BodyDef bd;
     bd.type = b2_staticBody;
-    b2Body* bounds = world->CreateBody(&bd);
+    arenaBoundsBody = world->CreateBody(&bd);
 
     b2ChainShape loop;
     b2Vec2 vertices[] = {
-        b2Vec2(-half, -half),
-        b2Vec2(-half, half),
-        b2Vec2(half, half),
-        b2Vec2(half, -half)
+        b2Vec2(-hx, -hy),
+        b2Vec2(-hx,  hy),
+        b2Vec2( hx,  hy),
+        b2Vec2( hx, -hy)
     };
     loop.CreateLoop(vertices, 4);
 
@@ -721,8 +777,9 @@ void CarGame::createArenaBounds() {
     fd.shape = &loop;
     fd.friction = 0.35f;
     fd.restitution = 0.25f;
-    bounds->CreateFixture(&fd);
+    arenaBoundsBody->CreateFixture(&fd);
 }
+
 
 void CarGame::createObstacles() {
     createWallBox(glm::vec2(10.0f, 10.0f), 6.0f, 1.0f, 25.0f * M_PI / 180.0f);
@@ -804,6 +861,20 @@ void CarGame::renderHud() {
         lastPrintTime = 0.0f;
     }
 }
+
+void CarGame::setEditorMode(bool enabled) {
+    if (!trackEditor) return;
+
+    if (enabled) {
+        trackEditor->setMode(EditorMode::EDIT_WALLS);
+        clearTrackCollision(); // опционально
+    } else {
+        trackEditor->setMode(EditorMode::PLAY);
+        buildTrackCollision();                 // <-- обязательно
+        if (car && track) car->reset(track->spawnPos, track->spawnYawRad);
+    }
+}
+
 
 void CarGame::renderTrackBackground() {
     // Placeholder - in a real implementation this would draw a textured quad

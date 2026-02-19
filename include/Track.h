@@ -49,6 +49,8 @@ struct Track {
     std::vector<Checkpoint> checkpoints;
     std::vector<SurfaceArea> surfaces;
     glm::vec2 spawnPos = glm::vec2(0.0f, 0.0f);
+    glm::vec2 arenaHalfExtents = glm::vec2(60.0f, 60.0f);
+
     float spawnYawRad = 0.0f;
 
     // Serialization

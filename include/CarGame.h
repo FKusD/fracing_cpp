@@ -33,11 +33,11 @@ public:
         return trackEditor && trackEditor->isEditing();
     }
 
-    void setEditorMode(bool active) {
-        if (trackEditor) {
-            trackEditor->setMode(active ? EditorMode::EDIT_WALLS : EditorMode::PLAY);
-        }
-    }
+    void setEditorMode(bool enabled);// {
+    //     if (trackEditor) {
+    //         trackEditor->setMode(active ? EditorMode::EDIT_WALLS : EditorMode::PLAY);
+    //     }
+    // }
 
 private:
     // УЛУЧШЕННЫЙ ЗУМ: уменьшаем VIEW_W и VIEW_H для увеличения машины на экране
@@ -53,6 +53,7 @@ private:
     std::unique_ptr<Telemetry> telemetry;
     std::unique_ptr<Track> track;
     std::vector<b2Body*> trackBodies;
+    b2Body* arenaBoundsBody = nullptr;
 
     GLFWwindow* window;
 

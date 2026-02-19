@@ -13,6 +13,11 @@ enum class EditorMode {
     EDIT_SURFACES   // Редактирование зон с разным сцеплением
 };
 
+enum class RenderMode {
+    SIMPLE_BOXES,
+    TEXTURED
+};
+
 // Состояние редактора
 class TrackEditor {
 public:
@@ -72,6 +77,7 @@ private:
     bool showGrid;
     float gridSize;
     bool snapToGrid;
+    RenderMode currentRenderMode = RenderMode::SIMPLE_BOXES;
     
     // Для преобразования координат
     glm::mat4 projectionMatrix;

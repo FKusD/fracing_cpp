@@ -112,7 +112,7 @@ void Application::run() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (!glfwWindowShouldClose(window)) {
-        if (ImGui::GetIO().WantCaptureMouse) std::cout << "ImGui catches mouse" << std::endl;
+        // if (ImGui::GetIO().WantCaptureMouse) std::cout << "ImGui catches mouse" << std::endl;
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
         lastTime = currentTime;
