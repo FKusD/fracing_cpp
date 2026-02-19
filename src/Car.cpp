@@ -24,23 +24,47 @@ void Car::setControls(float throttle, float brake, float steer, bool handbrake) 
 }
 
 void Car::fixedUpdate(float dt) {
-    model.update(state, controls, params, muSurface, dt);
+    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: читаем реальную скорость от Box2D ПЕРЕД обновлением физики
+    // Это позволяет учитывать столкновения и правильно отображать скорость
+    b2Vec2 currentVel = body->GetLinearVelocity();
+    float actualSpeed = currentVel.Length();
 
-    // ВАЖНО: не телепортируем Box2D body по позиции каждый тик (SetTransform),
-    // иначе контакты/коллизии не смогут корректно "выталкивать" машину из стен.
-    //
-    // Даем Box2D решать позицию через velocity + solver, а мы управляем ориентацией и скоростью.
-    const b2Vec2 currentPos = body->GetPosition();
-    body->SetTransform(currentPos, state.yawRad);
-
+    // Определяем направление движения относительно ориентации машины
     float cos_yaw = cosf(state.yawRad);
     float sin_yaw = sinf(state.yawRad);
+
+    // Проекция скорости на направление машины
+    float forwardVel = currentVel.x * cos_yaw + currentVel.y * sin_yaw;
+
+    // Если машина столкнулась и её реальная скорость сильно отличается от расчетной,
+    // синхронизируем состояние с физикой Box2D
+    if (std::abs(actualSpeed - std::abs(state.v)) > 1.0f) {
+        // Машина столкнулась или была остановлена физикой
+        state.v = forwardVel;
+    }
+
+    // Обновляем физическую модель
+    model.update(state, controls, params, muSurface, dt);
+
+    // Синхронизируем позицию с Box2D (но не телепортируем, чтобы коллизии работали)
+    const b2Vec2 currentPos = body->GetPosition();
+
+    // ИСПРАВЛЕНИЕ: Обновляем только ориентацию, позицию оставляем Box2D
+    body->SetTransform(currentPos, state.yawRad);
+
+    // Применяем расчетную скорость к Box2D
+    cos_yaw = cosf(state.yawRad);
+    sin_yaw = sinf(state.yawRad);
 
     b2Vec2 vel(cos_yaw * state.v, sin_yaw * state.v);
     body->SetLinearVelocity(vel);
 
     // Не даем Box2D "докручивать" машину контактами (мы задаем yaw сами выше)
     body->SetAngularVelocity(0.0f);
+
+    // ВАЖНО: После столкновения со стеной синхронизируем состояние позиции
+    state.pos.x = currentPos.x;
+    state.pos.y = currentPos.y;
 }
 
 void Car::reset(const glm::vec2& pos) {
@@ -82,6 +106,9 @@ void Car::createBody(const glm::vec2& startPos) {
     // Мы управляем ориентацией сами (yaw), поэтому фиксируем вращение от физических моментов
     bd.fixedRotation = true;
 
+    // ИСПРАВЛЕНИЕ: Добавляем линейное затухание для более реалистичного поведения при столкновениях
+    bd.linearDamping = 0.1f;
+
     body = world->CreateBody(&bd);
 
     b2PolygonShape shape;
@@ -92,7 +119,8 @@ void Car::createBody(const glm::vec2& startPos) {
     fd.shape = &shape;
     fd.density = 1.0f;
     fd.friction = 0.5f;
-    fd.restitution = 0.15f; // slightly more bounce off walls
+    // ИСПРАВЛЕНИЕ: Уменьшаем отскок для более реалистичных столкновений
+    fd.restitution = 0.05f; // было 0.15f - теперь почти нет отскока
 
     body->CreateFixture(&fd);
 }

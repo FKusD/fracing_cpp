@@ -5,6 +5,8 @@
 #include "Box2D/Box2D.h"
 #include <glm/glm.hpp>
 #include <string>
+#include "TrackEditor.h"
+
 
 // Forward declaration, чтобы не тянуть GLFW и GL в заголовок
 struct GLFWwindow;
@@ -23,14 +25,28 @@ public:
     void render();
     void handleInput();
     void resize(int width, int height);
+    TrackEditor* getTrackEditor() { return trackEditor.get(); }
 
     void shutdown();
 
-private:
-    static constexpr float VIEW_W = 32.0f;
-    static constexpr float VIEW_H = 18.0f;
-    static constexpr float PPM = 32.0f; // Pixels Per Meter
+    bool isEditorMode() const {
+        return trackEditor && trackEditor->isEditing();
+    }
 
+    void setEditorMode(bool active) {
+        if (trackEditor) {
+            trackEditor->setMode(active ? EditorMode::EDIT_WALLS : EditorMode::PLAY);
+        }
+    }
+
+private:
+    // УЛУЧШЕННЫЙ ЗУМ: уменьшаем VIEW_W и VIEW_H для увеличения машины на экране
+    // Было: 32x18, стало: 24x13.5 (примерно 33% увеличение)
+    static constexpr float VIEW_W = 24.0f;  // было 32.0f
+    static constexpr float VIEW_H = 13.5f;  // было 18.0f
+    static constexpr float PPM = 32.0f;     // Pixels Per Meter
+
+    std::unique_ptr<TrackEditor> trackEditor;
     b2World* world;
     b2Vec2 gravity;
     std::unique_ptr<Car> car;
@@ -43,6 +59,9 @@ private:
     // Camera
     glm::mat4 projection;
     glm::vec3 cameraPos;
+
+    // НОВОЕ: динамический зум (можно будет изменять в runtime)
+    float zoomLevel = 1.0f; // 1.0 = базовый зум, 1.5 = увеличено, 0.5 = уменьшено
 
     // Timing
     float accumulator;

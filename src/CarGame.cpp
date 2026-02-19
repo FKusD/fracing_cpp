@@ -138,10 +138,10 @@ struct SimpleRenderer {
     }
 };
 
-SimpleRenderer& renderer() {
-    static SimpleRenderer r;
-    return r;
-}
+// SimpleRenderer& renderer() {
+//     static SimpleRenderer r;
+//     return r;
+// }
 
 struct DebugLineRenderer {
     GLuint vao = 0;
@@ -348,10 +348,10 @@ struct ImGuiHud {
     }
 };
 
-ImGuiHud& hud() {
-    static ImGuiHud h;
-    return h;
-}
+// ImGuiHud& hud() {
+//     static ImGuiHud h;
+//     return h;
+// }
 } // namespace
 
 CarGame::CarGame()
@@ -372,20 +372,38 @@ bool CarGame::initialize() {
     projection = glm::ortho(-VIEW_W/2, VIEW_W/2, -VIEW_H/2, VIEW_H/2, -1.0f, 1.0f);
     cameraPos = glm::vec3(0.0f, 0.0f, 0.0f);
 
+    track = std::make_unique<Track>();
+    track->name = "Default Track";
+    track->spawnPos = glm::vec2(0.0f, 0.0f);
+    track->spawnYawRad = 0.0f;
+
+    std::cout << "✓ Track created: " << track.get() << std::endl;
+    std::cout << "✓ Track name: " << track->name << std::endl;
+
+    std::cout << "About to create TrackEditor..." << std::endl;
+    trackEditor = std::make_unique<TrackEditor>();
+    std::cout << "✓ TrackEditor created" << std::endl;
+    std::cout << "About to call setTrack..." << std::endl;
+    trackEditor->setTrack(track.get());
+    std::cout << "✓ setTrack done" << std::endl;
+    trackEditor->setViewportSize(1280, 720);
+
     // Load track (data) and build collision
     const bool trackOk = loadTrack();
+
+    // 2. Потом отдаем редактору (уже финальный указатель)
+    if (trackEditor) {
+        trackEditor->setTrack(track.get());
+    }
+
     if (trackOk) {
         buildTrackCollision();
-    } else {
-        // Fallback: hardcoded arena
-        createArenaBounds();
-        createObstacles();
     }
 
     // Create car at spawn
     const glm::vec2 spawnPos = (trackOk && track) ? track->spawnPos : glm::vec2(0.0f, 0.0f);
     const float spawnYawRad = (trackOk && track) ? track->spawnYawRad : 0.0f;
-    car = std::make_unique<Car>(world, spawnPos);
+    car = std::make_unique<Car>(world, track->spawnPos);
     car->reset(spawnPos, spawnYawRad);
 
     // Create telemetry system
@@ -401,120 +419,118 @@ bool CarGame::initialize() {
 
     // ImGui HUD
     window = glfwGetCurrentContext();
-    hud().init(window);
+    // hud().init(window);
+    // Вместо hud().init(window);
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Включаем клавиатуру
+    ImGui_ImplGlfw_InitForOpenGL(window, true); // true - важно для обработки мыши
+    ImGui_ImplOpenGL3_Init("#version 330 core");
 
     return true;
 }
 
 void CarGame::update(float deltaTime) {
-    handleInput();
-
-    // Fixed timestep update
-    accumulator += deltaTime;
-    while (accumulator >= STEP) {
-        car->fixedUpdate(STEP);
-        world->Step(STEP, V_IT, P_IT);
-        telemetry->update(
-            STEP,
-            car->getPosition(),
-            car->getSpeed(),
-            car->getSteer(),
-            car->getThrottle(),
-            car->getBrake()
-        );
-        accumulator -= STEP;
+    // if (ImGui::IsAnyItemHovered()) {
+    //     std::cout << "Мышь над кнопкой!" << std::endl;
+    // }
+    // Обновляем редактор
+    if (trackEditor) {
+        trackEditor->update(deltaTime);
     }
+    if (!trackEditor || !trackEditor->isEditing()) {
+        // handleInput();
 
-    updateCamera();
+        // Fixed timestep update
+        accumulator += deltaTime;
+        while (accumulator >= STEP) {
+            handleInput();
+            car->fixedUpdate(STEP);
+            world->Step(STEP, V_IT, P_IT);
+            telemetry->update(
+                STEP,
+                car->getPosition(),
+                car->getSpeed(),
+                car->getSteer(),
+                car->getThrottle(),
+                car->getBrake()
+            );
+            accumulator -= STEP;
+        }
+
+        updateCamera();
+    }
 }
 
 void CarGame::render() {
-    // На всякий случай обновим viewport под текущий framebuffer
-    if (GLFWwindow* ctx = glfwGetCurrentContext()) {
-        int fbw = 0, fbh = 0;
+    // 1. Получаем размеры окна
+    int fbw = 0, fbh = 0;
+    GLFWwindow* ctx = glfwGetCurrentContext();
+    if (ctx) {
         glfwGetFramebufferSize(ctx, &fbw, &fbh);
         glViewport(0, 0, fbw, fbh);
     }
 
-    // Clear screen
+    // 2. ИНИЦИАЛИЗАЦИЯ КАДРА IMGUI (Строго один раз!)
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    // 3. ОЧИСТКА ЭКРАНА
     glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Render track background
+    // 4. РЕНДЕР МИРА (Box2D и Траектория)
     renderTrackBackground();
-
-    // Render physics debug info if enabled
     if (showPhysics) {
-        // Debug draw Box2D в координатах мира с матрицей камеры
         box2dDebugDraw().currentMVP = projection;
         debugRenderer().beginFrame();
         world->DebugDraw();
-    } else {
-        // Фоллбек: тестовый треугольник
-        renderer().draw();
     }
 
-    // Trajectory (telemetry)
     if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
         debugRenderer().beginFrame();
         const auto& tr = telemetry->trajectory;
         for (size_t i = 1; i < tr.size(); ++i) {
-            const glm::vec2& a = tr[i - 1];
-            const glm::vec2& b = tr[i];
-            debugRenderer().addLine(b2Vec2(a.x, a.y), b2Vec2(b.x, b.y));
+            debugRenderer().addLine(b2Vec2(tr[i-1].x, tr[i-1].y), b2Vec2(tr[i].x, tr[i].y));
         }
         debugRenderer().flush(projection, 1.0f, 0.7f, 0.15f, 0.65f);
-        debugRenderer().beginFrame();
     }
 
-    // HUD поверх мира
+    // 5. РЕНДЕР ГРАФИКИ РЕДАКТОРА (Линии, точки)
+    if (trackEditor) {
+        trackEditor->setProjectionMatrix(projection);
+        trackEditor->setViewportSize(fbw, fbh);
+        trackEditor->render();
+    }
+
+    // 6. ОТРИСОВКА ИНТЕРФЕЙСА (HUD и Окна редактора)
     if (showHud) {
-        hud().newFrame();
-
-        ImGui::SetNextWindowBgAlpha(0.85f);
-        ImGui::Begin("Telemetry / Debug", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-
-        const glm::vec2 pos = car ? car->getPosition() : glm::vec2(0.0f);
-        const float speed = car ? car->getSpeed() : 0.0f;
-        const float yawDeg = car ? (car->getAngleRad() * 180.0f / static_cast<float>(M_PI)) : 0.0f;
-
+        ImGui::Begin("Game Debug", &showHud, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-        ImGui::Separator();
-        ImGui::Text("Pos: (%.2f, %.2f)", pos.x, pos.y);
-        ImGui::Text("Yaw: %.1f deg", yawDeg);
-        ImGui::Text("Speed: %.2f m/s", speed);
 
-        if (car) {
-            ImGui::Text("Input: T=%.2f B=%.2f S=%.2f HB=%s",
-                        car->getThrottle(), car->getBrake(), car->getSteer(),
-                        car->isHandbrake() ? "ON" : "OFF");
-            ImGui::Text("Mu: %.2f | Wheelbase: %.2f", car->getMuSurface(), car->getParams().wheelbase);
+        if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Show physics (F2)", &showPhysics);
+            ImGui::Checkbox("Show trajectory", &showTrajectory);
+            if (ImGui::Button("Reset Car (R)")) {
+                const glm::vec2 spawnPos = (track ? track->spawnPos : glm::vec2(0.0f, 0.0f));
+                car->reset(spawnPos, track ? track->spawnYawRad : 0.0f);
+                telemetry->reset();
+            }
         }
 
-        if (telemetry) {
+        // Вызываем UI редактора ВНУТРИ кадра ImGui
+        if (trackEditor && trackEditor->isEditing()) {
             ImGui::Separator();
-            ImGui::Text("Lap: %.3fs (last: %.3fs)", telemetry->getCurrentLapTime(), telemetry->getLastLapTime());
-            ImGui::Text("Sector: %d | sector time: %.3fs", telemetry->getCurrentSector(), telemetry->getCurrentSectorTime());
-            ImGui::Text("Tire temp: %.1f C", telemetry->getTireTempC());
-        }
-
-        ImGui::Separator();
-        ImGui::Checkbox("Show physics (F2)", &showPhysics);
-        ImGui::Checkbox("Show HUD (F1)", &showHud);
-        ImGui::Checkbox("Show trajectory", &showTrajectory);
-        if (telemetry) {
-            ImGui::SliderInt("Trajectory points", &telemetry->maxTrajectoryPoints, 50, 20000);
-        }
-        if (ImGui::Button("Reset (R)")) {
-            const glm::vec2 spawnPos = (track ? track->spawnPos : glm::vec2(0.0f, 0.0f));
-            const float spawnYawRad = (track ? track->spawnYawRad : 0.0f);
-            if (car) car->reset(spawnPos, spawnYawRad);
-            if (telemetry) telemetry->reset();
+            trackEditor->renderUI();
         }
         ImGui::End();
-
-        hud().render();
     }
+
+    // 7. ЗАВЕРШЕНИЕ КАДРА IMGUI
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
 void CarGame::handleInput() {
@@ -524,6 +540,23 @@ void CarGame::handleInput() {
     if (!currentWindow) {
         // Try to get the main window through some global reference
         // For now, we'll skip input handling if we can't find the window
+        return;
+    }
+
+    // F3 - переключение режима редактора
+    static bool f3Pressed = false;
+    bool f3CurrentlyPressed = glfwGetKey(currentWindow, GLFW_KEY_F3) == GLFW_PRESS;
+    if (f3CurrentlyPressed && !f3Pressed && trackEditor) {
+        if (trackEditor->getMode() == EditorMode::PLAY) {
+            trackEditor->setMode(EditorMode::EDIT_WALLS);
+        } else {
+            trackEditor->setMode(EditorMode::PLAY);
+        }
+    }
+    f3Pressed = f3CurrentlyPressed;
+
+    // Если редактор активен, не обрабатываем игровые контролы
+    if (trackEditor && trackEditor->isEditing()) {
         return;
     }
 
@@ -584,12 +617,19 @@ void CarGame::handleInput() {
 }
 
 void CarGame::resize(int width, int height) {
+    (void)width;
+    (void)height;
     // Update aspect ratio if needed
     // For now, we keep the same orthographic projection regardless of window size
 }
 
 void CarGame::shutdown() {
-    hud().shutdown();
+    // Вместо hud().shutdown() используем прямые вызовы очистки ImGui
+    if (ImGui::GetCurrentContext()) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+    }
 
     if (world) {
         clearTrackCollision();
@@ -708,16 +748,34 @@ void CarGame::createWallBox(const glm::vec2& center, float hx, float hy, float a
 }
 
 void CarGame::updateCamera() {
+    // 1. Получаем реальные размеры окна
+    int w, h;
+    glfwGetFramebufferSize(window, &w, &h);
+
+    // Защита от деления на ноль (если свернули окно)
+    if (h == 0) h = 1;
+
+    // 2. Считаем соотношение сторон
+    float aspect = (float)w / (float)h;
+
+    // 3. Базовая высота в метрах Box2D (сколько метров видно по вертикали)
+    float viewHeightMeters = 20.0f; // Настрой под свой вкус (зум)
+    float viewWidthMeters = viewHeightMeters * aspect;
+
+    // 4. Сглаживание движения камеры (Lerp)
     glm::vec2 p = car->getPosition();
-    float lerp = 0.12f;
+    float lerp = 0.1f;
+    cameraPos.x += (p.x - cameraPos.x) * lerp;
+    cameraPos.y += (p.y - cameraPos.y) * lerp;
 
-    cameraPos.x = cameraPos.x * (1.0f - lerp) + p.x * lerp;
-    cameraPos.y = cameraPos.y * (1.0f - lerp) + p.y * lerp;
+    // 5. Создаем проекцию
+    // Координаты: Лево, Право, Низ, Верх, Near, Far
+    const glm::mat4 proj = glm::ortho(
+        -viewWidthMeters / 2.0f, viewWidthMeters / 2.0f,
+        -viewHeightMeters / 2.0f, viewHeightMeters / 2.0f,
+        -1.0f, 1.0f
+    );
 
-    // MVP для рендера в координатах мира.
-    // Важно: порядок умножения матриц в GLM — справа налево (колонно-ориентированные матрицы).
-    // Нужно: clip = Ortho * ViewTranslate * worldPos.
-    const glm::mat4 proj = glm::ortho(-VIEW_W / 2, VIEW_W / 2, -VIEW_H / 2, VIEW_H / 2, -1.0f, 1.0f);
     const glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(-cameraPos.x, -cameraPos.y, 0.0f));
     projection = proj * view;
 }

@@ -2,25 +2,28 @@
 
 struct VehicleParams {
     // Geometry
-    float wheelbase = 2.8f; // meters
+    float wheelbase = 2.5f; // УМЕНЬШЕНО с 2.8м - еще меньший радиус разворота
 
     // Mass and dynamics
     float mass = 1200.0f;       // kg
-    float engineForce = 9000.0f; // N (max traction)
-    float brakeForce = 14000.0f; // N (max braking)
+    float engineForce = 10000.0f; // УВЕЛИЧЕНО с 9000 - более отзывчивый разгон
+    float brakeForce = 16000.0f; // УВЕЛИЧЕНО с 14000 - лучше тормоза
 
     // Resistances (simplified)
-    float rolling = 30.0f; // N per m/s (linear)
-    float drag = 45.0f;    // N per (m/s)^2
+    float rolling = 25.0f; // УМЕНЬШЕНО с 30 - меньше сопротивление качению
+    float drag = 40.0f;    // УМЕНЬШЕНО с 45 - меньше аэродинамическое сопротивление
 
-    // Steering
-    float steerLockLowSpeedDeg = 32.0f; // max steering angle at low speed
-    float steerLockHighSpeedDeg = 8.0f; // max steering angle at high speed
-    float steerHighSpeedAt = 35.0f;     // m/s, where high-speed settings apply
+    // МАКСИМАЛЬНО УЛУЧШЕННАЯ РУЛЕЖКА
+    float steerLockLowSpeedDeg = 50.0f; // было 45° - теперь 50° (почти как у картинга)
+    float steerLockHighSpeedDeg = 15.0f; // было 12° - чуть больше контроля на скорости
+    float steerHighSpeedAt = 25.0f;     // было 30 - еще раньше начинаем ограничивать
+
+    // ДОПОЛНИТЕЛЬНЫЙ ПАРАМЕТР: скорость реакции руля (0-1, где 1 = мгновенно)
+    float steerResponseSpeed = 0.85f; // быстрая, но не мгновенная реакция
 
     // Grip limits
     float g = 9.81f;         // m/s^2
-    float muAsphalt = 1.15f; // base grip coefficient
+    float muAsphalt = 1.20f; // УВЕЛИЧЕНО с 1.15 - немного больше сцепления
 
     // Limits
     float maxForwardSpeed = 60.0f; // m/s (safety limit)

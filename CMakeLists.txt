@@ -67,6 +67,8 @@ add_executable(fracing_cpp
         src/VehicleModel.cpp
         src/Telemetry.cpp
         src/Track.cpp
+        src/Trackeditor.cpp
+        include/Trackeditor.h
 )
 
 add_library(glad STATIC

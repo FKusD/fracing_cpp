@@ -18,10 +18,20 @@ void VehicleModel::update(VehicleState& s, const VehicleControls& u, const Vehic
     float traction = u.throttle * p.engineForce; // N
     float braking = u.brake * p.brakeForce;      // N
 
-    // Handbrake: assume it significantly reduces grip and adds braking
+    // ИСПРАВЛЕНИЕ РУЧНИКА: он должен останавливать машину, а не толкать назад
     if (u.handbrake) {
-        braking = std::max(braking, 0.6f * p.brakeForce);
-        muSurface *= 0.55f;
+        // Ручник блокирует задние колеса - сильное торможение
+        braking = std::max(braking, 0.85f * p.brakeForce);
+
+        // Сильно снижаем сцепление (имитация блокировки колес)
+        muSurface *= 0.4f;
+
+        // ВАЖНО: при низкой скорости ручник должен полностью останавливать машину
+        if (std::abs(s.v) < 0.5f) {
+            s.v = 0.0f;
+            // Блокируем любое движение при стоящей машине с ручником
+            return;
+        }
     }
 
     // Resistances
@@ -39,6 +49,11 @@ void VehicleModel::update(VehicleState& s, const VehicleControls& u, const Vehic
     // 3) Integrate velocity
     s.v += aLong * dt;
     s.v = std::clamp(s.v, -p.maxReverseSpeed, p.maxForwardSpeed);
+
+    // При очень малой скорости и без газа - останавливаем машину
+    if (std::abs(s.v) < 0.1f && u.throttle < 0.01f) {
+        s.v = 0.0f;
+    }
 
     // 4) Turning kinematics (bicycle model): yawRate = v/L * tan(delta)
     // For small angles tan(delta) ~ delta, but we'll keep tan.
