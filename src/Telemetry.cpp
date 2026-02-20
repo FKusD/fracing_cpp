@@ -14,29 +14,37 @@ Telemetry::~Telemetry() {
 }
 
 void Telemetry::update(float dt, const glm::vec2& position, float speed, float steer, float throttle, float brake) {
-    // Update lap time
-    currentLapTime += dt;
+    update(dt, position, speed, steer, throttle, brake, false, 1.0f, 0.0f);
+}
 
-    // Update sector time
+void Telemetry::update(float dt, const glm::vec2& position, float speed, float steer, float throttle, float brake,
+                       bool handbrake, float mu, float vLat) {
+    currentLapTime += dt;
     currentSectorTime += dt;
 
-    // Calculate distance traveled since last update
     glm::vec2 displacement = position - lastPosition;
-    float distance = glm::length(displacement);
-    totalDistance += distance;
+    totalDistance += glm::length(displacement);
     lastPosition = position;
 
-    // Simple tire temperature model (increases with speed and lateral forces)
-    float lateralForceFactor = std::abs(steer) * std::abs(speed);
+    float lateralForceFactor = std::abs(vLat);
     float longitudinalForceFactor = (throttle + brake) * std::abs(speed);
     float tempIncrease = (lateralForceFactor + longitudinalForceFactor) * 0.01f;
-    tireTempC += tempIncrease - (tireTempC - 20.0f) * 0.001f; // Natural cooling
+    tireTempC += tempIncrease - (tireTempC - 20.0f) * 0.001f;
+
+    latest.t += dt;
+    latest.pos = position;
+    latest.speed = speed;
+    latest.steer = steer;
+    latest.throttle = throttle;
+    latest.brake = brake;
+    latest.handbrake = handbrake;
+    latest.mu = mu;
+    latest.vLat = vLat;
 
     trajectory.push_back(position);
-    if (trajectory.size() > maxTrajectoryPoints) {
-        trajectory.erase(trajectory.begin());
-    }
+    if (trajectory.size() > maxTrajectoryPoints) trajectory.erase(trajectory.begin());
 }
+
 
 void Telemetry::reset() {
     currentLapTime = 0.0f;
@@ -54,4 +62,5 @@ void Telemetry::reset() {
     totalDistance = 0.0f;
 
     trajectory.clear();
+    latest = Sample{};
 }

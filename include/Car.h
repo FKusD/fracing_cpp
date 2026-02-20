@@ -21,14 +21,17 @@ public:
     glm::vec2 getPosition() const;
     float getAngleRad() const;
     float getSpeed() const;
+    float getLongitudinalSpeed() const { return vLong; }
+    float getLateralSpeed() const { return vLat; }
 
     float getThrottle() const { return controls.throttle; }
     float getBrake() const { return controls.brake; }
     float getSteer() const { return controls.steer; }
     bool isHandbrake() const { return controls.handbrake; }
 
-    float getMuSurface() const { return muSurface; }
-    void setMuSurface(float muSurface) { this->muSurface = muSurface; }
+    void setSurfaceMu(float mu) { muSurface = mu; }
+    float getSurfaceMu() const { return muSurface; }
+    float getDefaultMu() const { return params.muAsphalt; }
 
     const VehicleParams& getParams() const { return params; }
 
@@ -42,6 +45,9 @@ private:
     VehicleModel model;
 
     float muSurface;
+
+    float vLong = 0.0f;
+    float vLat  = 0.0f;
 
     void createBody(const glm::vec2& startPos);
 };

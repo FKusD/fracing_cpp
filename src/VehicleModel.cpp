@@ -10,35 +10,57 @@ void VehicleModel::update(VehicleState& s, const VehicleControls& u, const Vehic
     // 1) Steering: angle limit depending on speed (higher speed -> less steering lock)
     float t = std::clamp(std::abs(s.v) / p.steerHighSpeedAt, 0.0f, 1.0f);
     float steerLockDeg = p.steerLockLowSpeedDeg + t * (p.steerLockHighSpeedDeg - p.steerLockLowSpeedDeg);
+
+    // Больше поворачиваемость (настройка)
+    steerLockDeg *= 1.35f;
+    steerLockDeg = std::min(steerLockDeg, 60.0f);
     float steerLockRad = steerLockDeg * M_PI / 180.0f;
 
     float steerAngle = std::clamp(u.steer, -1.0f, 1.0f) * steerLockRad;
 
     // 2) Longitudinal forces
-    float traction = u.throttle * p.engineForce; // N
+    float traction = u.throttle * p.engineForce * 0.70f;
     float braking = u.brake * p.brakeForce;      // N
 
-    // ИСПРАВЛЕНИЕ РУЧНИКА: он должен останавливать машину, а не толкать назад
+    // РУЧНИК: должен всегда замедлять, независимо от направления движения
     if (u.handbrake) {
-        // Ручник блокирует задние колеса - сильное торможение
-        braking = std::max(braking, 0.85f * p.brakeForce);
+        // При ручнике отключаем тягу
+        traction = 0.0f;
 
-        // Сильно снижаем сцепление (имитация блокировки колес)
+        // Сцепление падает (скольжение)
         muSurface *= 0.4f;
 
-        // ВАЖНО: при низкой скорости ручник должен полностью останавливать машину
-        if (std::abs(s.v) < 0.5f) {
+        // При малой скорости — стоп
+        if (std::abs(s.v) < 0.7f) {
             s.v = 0.0f;
-            // Блокируем любое движение при стоящей машине с ручником
             return;
         }
+
+        // Ручник создаёт силу, направленную ПРОТИВ текущей скорости
+        float signV = (s.v >= 0.0f) ? 1.0f : -1.0f;
+        // braking тут храним как модуль силы (положительный)
+        braking = std::max(braking, 0.90f * p.brakeForce);
+
+        // Важно: позже мы учтём направление через signV
+        // Поэтому сохраним signV в локальную переменную ниже (см. дальше)
     }
 
-    // Resistances
-    float resist = p.rolling * s.v + p.drag * s.v * std::abs(s.v); // N (rolling + quadratic drag)
 
-    // Resultant force along direction of travel
+    // Resistances should oppose motion
+    float resist = p.rolling * ((s.v >= 0.0f) ? 1.0f : -1.0f) + p.drag * s.v * std::abs(s.v);
+
+    // Base force (keep your scheme: brake acts like reverse throttle)
     float F = traction - braking - resist;
+
+    // If handbrake: override braking to oppose velocity
+    if (u.handbrake) {
+        float signV = (s.v >= 0.0f) ? 1.0f : -1.0f;
+        // Add extra braking opposite motion (i.e. subtract signV * |brake|)
+        // Since F is "forward-direction force", opposing motion means:
+        // when v>0 -> subtract positive; when v<0 -> subtract negative (=> adds positive)
+        F -= signV * (0.90f * p.brakeForce);
+    }
+
 
     // Grip limitation: |F_long| <= mu*m*g
     float Fmax = muSurface * p.mass * p.g;

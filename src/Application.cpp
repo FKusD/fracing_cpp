@@ -16,6 +16,22 @@
 // Глобальный указатель, чтобы статические функции видели редактор
 static TrackEditor* g_editorPtr = nullptr;
 
+static void getCursorPosFramebuffer(GLFWwindow* window, double* outX, double* outY) {
+    double x, y;
+    glfwGetCursorPos(window, &x, &y);
+
+    int winW, winH;
+    int fbW, fbH;
+    glfwGetWindowSize(window, &winW, &winH);
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+
+    const float sx = (winW > 0) ? (float)fbW / (float)winW : 1.0f;
+    const float sy = (winH > 0) ? (float)fbH / (float)winH : 1.0f;
+
+    *outX = x * sx;
+    *outY = y * sy;
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
     // 1. Принудительно отдаем событие в бэкенд ImGui
     ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
@@ -26,7 +42,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     // 3. Если мышь в «мире» — работает редактор
     if (g_editorPtr) {
         double x, y;
-        glfwGetCursorPos(window, &x, &y);
+        getCursorPosFramebuffer(window, &x, &y);
         g_editorPtr->handleMouseButton(button, action, x, y);
     }
 }
@@ -35,20 +51,41 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
     // Сообщаем ImGui, куда двинулась мышь
     ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
 
-    if (g_editorPtr) g_editorPtr->handleMouseMove(xpos, ypos);
+    if (g_editorPtr) {
+        // Приводим координаты к framebuffer space, чтобы совпадало с glViewport
+        int winW, winH;
+        int fbW, fbH;
+        glfwGetWindowSize(window, &winW, &winH);
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+
+        const float sx = (winW > 0) ? (float)fbW / (float)winW : 1.0f;
+        const float sy = (winH > 0) ? (float)fbH / (float)winH : 1.0f;
+
+        g_editorPtr->handleMouseMove(xpos * sx, ypos * sy);
+    }
 }
 
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
-    (void)window; (void)xoffset;
+    // СНАЧАЛА ImGui
+    ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+
     if (ImGui::GetIO().WantCaptureMouse) return;
     if (g_editorPtr) g_editorPtr->handleScroll(yoffset);
 }
 
+
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    (void)window; (void)scancode; (void)mods;
-    // Даем ImGui обработать клавиши (например, ввод текста в поле сохранения)
+    // СНАЧАЛА всегда отдаем событие ImGui
+    ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+
+    // Если ImGui сейчас вводит текст — НЕ трогаем редактор
     if (ImGui::GetIO().WantCaptureKeyboard) return;
+
     if (g_editorPtr) g_editorPtr->handleKeyPress(key, action);
+}
+
+void char_callback(GLFWwindow* window, unsigned int c) {
+    ImGui_ImplGlfw_CharCallback(window, c);
 }
 
 
@@ -80,19 +117,18 @@ bool Application::initialize() {
 
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
+    glfwSetWindowUserPointer(window, this);
 
-    // Инициализация загрузчика OpenGL (GLAD)
-    #ifndef __APPLE__
-        if (gladLoadGL((GLADloadfunc)glfwGetProcAddress) == 0) {
-            std::cerr << "Failed to initialize OpenGL loader!" << std::endl;
-            return false;
-        }
-    #endif
 
-    // Enable vsync
+#ifndef __APPLE__
+    if (gladLoadGL((GLADloadfunc)glfwGetProcAddress) == 0) {
+        std::cerr << "Failed to initialize OpenGL loader!" << std::endl;
+        return false;
+    }
+#endif
+
     glfwSwapInterval(1);
 
-    // Create the game instance
     game = std::make_unique<CarGame>();
     if (!game->initialize()) {
         std::cerr << "Failed to initialize game!" << std::endl;
@@ -104,6 +140,13 @@ bool Application::initialize() {
     glfwSetCursorPosCallback(window, cursor_position_callback);
     glfwSetScrollCallback(window, scroll_callback);
     glfwSetKeyCallback(window, key_callback);
+    glfwSetCharCallback(window, char_callback);
+
+
+    // Инициализируем viewport/editor viewport корректно сразу
+    int fbW, fbH;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    framebufferSizeCallback(window, fbW, fbH);
 
     return true;
 }
@@ -112,7 +155,6 @@ void Application::run() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (!glfwWindowShouldClose(window)) {
-        // if (ImGui::GetIO().WantCaptureMouse) std::cout << "ImGui catches mouse" << std::endl;
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
         lastTime = currentTime;
@@ -127,19 +169,14 @@ void Application::run() {
 }
 
 void Application::handleInput() {
-    // Используем static bool, чтобы кнопка не "дребезжала" (срабатывала 60 раз в секунду)
     static bool escPressed = false;
     bool escNow = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
 
     if (escNow && !escPressed) {
-        // Логика переключения
         if (game->isEditorMode()) {
-            game->setEditorMode(false); // Выход из редактора в игру
+            game->setEditorMode(false);
         } else {
-            // Если мы в игре — открываем меню или ставим паузу
-            // game->togglePauseMenu();
-            // А закрываем только если меню уже открыто и жмем еще раз:
-            glfwSetWindowShouldClose(window, true); // Временное решение
+            glfwSetWindowShouldClose(window, true);
         }
     }
     escPressed = escNow;
@@ -154,6 +191,12 @@ void Application::shutdown() {
 
 void Application::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
-    // Notify game about resize
-    // reinterpret_cast<CarGame*>(glfwGetWindowUserPointer(window))->resize(width, height);
+
+    auto* app = reinterpret_cast<Application*>(glfwGetWindowUserPointer(window));
+    if (app && app->game) {
+        app->game->resize(width, height);
+        if (app->game->getTrackEditor()) {
+            app->game->getTrackEditor()->setViewportSize(width, height);
+        }
+    }
 }

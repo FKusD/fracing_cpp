@@ -1,16 +1,18 @@
 #pragma once
 
 #include <vector>
+#include <string>
+#include <array>
 #include <glm/glm.hpp>
 #include "Track.h"
 
 // Режим редактирования
 enum class EditorMode {
-    PLAY,           // Обычная игра - редактор выключен
-    EDIT_WALLS,     // Редактирование стен
-    EDIT_CHECKPOINTS, // Редактирование чекпоинтов
-    EDIT_SPAWN,     // Установка стартовой позиции
-    EDIT_SURFACES   // Редактирование зон с разным сцеплением
+    PLAY,
+    EDIT_WALLS,
+    EDIT_CHECKPOINTS,
+    EDIT_SPAWN,
+    EDIT_SURFACES
 };
 
 enum class RenderMode {
@@ -18,78 +20,89 @@ enum class RenderMode {
     TEXTURED
 };
 
-// Состояние редактора
 class TrackEditor {
 public:
     TrackEditor();
     ~TrackEditor() = default;
 
-    // Основные методы
     void update(float dt);
     void handleMouseButton(int button, int action, double mouseX, double mouseY);
     void handleMouseMove(double mouseX, double mouseY);
     void handleKeyPress(int key, int action);
     void handleScroll(double yoffset);
-    
-    // Рендеринг
+
     void render();
-    void renderUI(); // ImGui интерфейс
-    
-    // Управление режимом
+    void renderUI();
+
     void setMode(EditorMode mode);
     EditorMode getMode() const { return mode; }
     bool isEditing() const { return mode != EditorMode::PLAY; }
-    
-    // Работа с трассой
+
     void setTrack(Track* track);
     void newTrack();
     bool saveTrack(const std::string& filename);
     bool loadTrack(const std::string& filename);
-    
-    // Операции редактирования
+
     void undo();
     void redo();
     void clearAll();
-    
-    // Утилиты
+
     glm::vec2 screenToWorld(double screenX, double screenY) const;
     void setProjectionMatrix(const glm::mat4& proj) { projectionMatrix = proj; }
     void setViewportSize(int width, int height) { viewportWidth = width; viewportHeight = height; }
+    void setCarPosition(const glm::vec2& p) { carWorldPos = p; }
+    const glm::mat4& getProjectionMatrix() const { return projectionMatrix; }
+
 
 private:
-    // Состояние
     EditorMode mode;
     Track* currentTrack;
-    bool isDirty; // Есть несохраненные изменения
-    
-    // Текущая операция
-    std::vector<glm::vec2> currentWallPoints;  // Точки текущей рисуемой стены
-    std::vector<glm::vec2> currentSurfacePoints; // Точки текущей зоны
-    int selectedObjectIndex; // Индекс выбранного объекта (-1 если ничего не выбрано)
-    
-    // Параметры текущих объектов
+    bool isDirty;
+
+    std::vector<glm::vec2> currentWallPoints;
+    std::vector<glm::vec2> currentSurfacePoints;
+    int selectedObjectIndex;
+
     float currentWallThickness;
     float currentWallFriction;
     float currentWallRestitution;
     float currentSurfaceMu;
-    
-    // Настройки отображения
+
     bool showGrid;
-    float gridSize;
+    int gridPow2 = 0;            // 0..8 (шаг = base / 2^gridPow2)
+    float gridBase = 1.0f;       // базовый шаг (обычно 1.0)
     bool snapToGrid;
+
     RenderMode currentRenderMode = RenderMode::SIMPLE_BOXES;
-    
-    // Для преобразования координат
+
+    // Камера редактора
+    glm::vec2 cameraPos = glm::vec2(0.0f);
+    float cameraZoom = 1.0f;
+    bool followCar = true;
+    bool isPanning = false;
+    glm::vec2 carWorldPos = glm::vec2(0.0f);
+    double lastMouseScreenX = 0.0;
+    double lastMouseScreenY = 0.0;
+
+    // Браузер треков
+    bool showTracksWindow = false;
+    std::vector<std::string> trackFiles;
+    int selectedTrackFile = -1;
+    std::string currentTrackPath;
+    std::array<char, 256> saveAsBuf{};
+
+    // Ввод размеров арены (буфер ввода ImGui)
+    bool arenaBufInit = false;
+    float arenaSizeBuf[2] = {120.0f, 120.0f};
+
     glm::mat4 projectionMatrix;
     int viewportWidth;
     int viewportHeight;
-    
-    // Мышь
+
     glm::vec2 mouseWorldPos;
     glm::vec2 lastMouseWorldPos;
     bool isDragging;
-    
-    // История для Undo/Redo
+
     struct HistoryState {
         Track trackState;
         std::string description;
@@ -97,15 +110,17 @@ private:
     std::vector<HistoryState> history;
     int historyIndex;
     static constexpr int MAX_HISTORY = 50;
-    
-    // Вспомогательные методы
+
     void addHistoryState(const std::string& description);
     void finishCurrentWall();
     void finishCurrentSurface();
     void deleteLastPoint();
     glm::vec2 snapToGridIfNeeded(const glm::vec2& pos) const;
-    
-    // Рендеринг элементов
+
+    void updateEditorProjection();
+    void refreshTrackList();
+    void syncArenaBufFromTrack();
+
     void renderGrid();
     void renderCurrentWall();
     void renderCurrentSurface();
@@ -114,8 +129,7 @@ private:
     void renderSpawnPoint();
     void renderSurfaces();
     void renderMouseCursor();
-    
-    // UI окна
+
     void renderMainToolbar();
     void renderPropertiesWindow();
     void renderObjectsList();

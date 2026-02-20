@@ -25,6 +25,25 @@ public:
 
     float getTireTempC() const { return tireTempC; }
 
+    struct Sample {
+        float t = 0.0f;
+        glm::vec2 pos{0.0f, 0.0f};
+        float speed = 0.0f;      // m/s
+        float steer = 0.0f;      // -1..1
+        float throttle = 0.0f;   // 0..1
+        float brake = 0.0f;      // 0..1
+        bool handbrake = false;
+        float mu = 1.0f;
+        float vLat = 0.0f;       // m/s
+    };
+
+    void update(float dt, const glm::vec2& position, float speed, float steer, float throttle, float brake,
+            bool handbrake, float mu, float vLat);
+
+    const Sample& getLatest() const { return latest; }
+
+
+
 private:
     float currentLapTime;
     float lastLapTime;
@@ -36,4 +55,6 @@ private:
     glm::vec2 lastPosition;
     float totalDistance;
     float sectorThreshold;
+    Sample latest;
+
 };

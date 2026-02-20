@@ -56,8 +56,36 @@ void Car::fixedUpdate(float dt) {
     cos_yaw = cosf(state.yawRad);
     sin_yaw = sinf(state.yawRad);
 
-    b2Vec2 vel(cos_yaw * state.v, sin_yaw * state.v);
-    body->SetLinearVelocity(vel);
+    // Текущая скорость Box2D
+    b2Vec2 v = body->GetLinearVelocity();
+
+    // Оси машины
+    // float cos_yaw = cosf(state.yawRad);
+    // float sin_yaw = sinf(state.yawRad);
+    b2Vec2 fwd(cos_yaw, sin_yaw);
+    b2Vec2 right(-sin_yaw, cos_yaw);
+
+    // Раскладываем скорость на продольную/поперечную
+    float vLong = b2Dot(v, fwd);
+    float vLat  = b2Dot(v, right);
+
+    // 1) Продольную скорость задаём из модели (state.v = целевая/рассчитанная продольная)
+    float targetLong = state.v;
+
+    // 2) Поперечную скорость "гасим" сцеплением.
+    // Чем больше mu, тем быстрее гасится боковой снос.
+    // При ручнике — гасим сильно слабее => появляется дрифт.
+    float latKill = 6.0f * muSurface;               // базовая "липкость"
+    if (controls.handbrake) latKill *= 0.20f;       // ручник = проще держать занос
+
+    // Экспоненциальное затухание (стабильно при любых dt)
+    float k = std::exp(-latKill * dt);
+    vLat *= k;
+
+    // Собираем новую скорость: продольная + поперечная
+    b2Vec2 vNew = targetLong * fwd + vLat * right;
+    body->SetLinearVelocity(vNew);
+
 
     // Не даем Box2D "докручивать" машину контактами (мы задаем yaw сами выше)
     body->SetAngularVelocity(0.0f);

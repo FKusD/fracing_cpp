@@ -310,6 +310,20 @@ Box2DDebugDraw& box2dDebugDraw() {
     return d;
 }
 
+static bool pointInPolygon(const glm::vec2& p, const std::vector<glm::vec2>& poly) {
+    if (poly.size() < 3) return false;
+    bool inside = false;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+        const glm::vec2& a = poly[i];
+        const glm::vec2& b = poly[j];
+        const bool intersect = ((a.y > p.y) != (b.y > p.y)) &&
+                               (p.x < (b.x - a.x) * (p.y - a.y) / ((b.y - a.y) + 1e-12f) + a.x);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+
 struct ImGuiHud {
     bool initialized = false;
 
@@ -355,6 +369,7 @@ struct ImGuiHud {
 // }
 } // namespace
 
+
 CarGame::CarGame()
     : world(nullptr), gravity(0.0f, 0.0f), car(nullptr), telemetry(nullptr), track(nullptr),
       window(nullptr), accumulator(0.0f), showHud(true), showPhysics(true), showTrajectory(true),
@@ -397,9 +412,12 @@ bool CarGame::initialize() {
         trackEditor->setTrack(track.get());
     }
 
+    // Границы арены зависят от трека и должны существовать всегда
+    createArenaBounds();
     if (trackOk) {
         buildTrackCollision();
     }
+
 
     // Create car at spawn
     const glm::vec2 spawnPos = (trackOk && track) ? track->spawnPos : glm::vec2(0.0f, 0.0f);
@@ -442,22 +460,25 @@ void CarGame::update(float deltaTime) {
 
     // Переход из редактора в игру
     if (wasEditing && !nowEditing) {
-        buildTrackCollision();                 // <-- ключ
-        // if (car && track) {
-        //     car->reset(track->spawnPos, track->spawnYawRad); // чтобы не заспавниться внутри стены
-        // }
+        createArenaBounds();
+        buildTrackCollision();
+        if (car && track) {
+            car->reset(track->spawnPos, track->spawnYawRad);
+        }
     }
     wasEditing = nowEditing;
 
-    // Обновляем редактор
+    // Обновляем редактор (позиция машины нужна для follow camera)
     if (trackEditor) {
+        if (car) trackEditor->setCarPosition(car->getPosition());
         trackEditor->update(deltaTime);
     }
 
     if (trackEditor && trackEditor->isEditing()) {
         trackEditor->update(deltaTime);
-        return; // В режиме редактора физику не считаем
+        return;
     }
+
 
     if (world->GetBodyCount() == 0) return;
 
@@ -465,11 +486,33 @@ void CarGame::update(float deltaTime) {
 
     if (!trackEditor || !trackEditor->isEditing()) {
         // handleInput();
+        glm::vec2 p = car->getPosition();
+        float mu = car->getDefaultMu(); // базовое покрытие
 
+        // Если поверхностей несколько и они перекрываются:
+        // 1) можно брать "самую скользкую" (min), чтобы было предсказуемо
+        for (const auto& s : track->surfaces) {
+            if (pointInPolygon(p, s.polygon)) {
+                mu = std::min(mu, s.mu);
+            }
+        }
+
+        car->setSurfaceMu(mu);
         // Fixed timestep update
         accumulator += deltaTime;
         while (accumulator >= STEP) {
             handleInput();
+            // Apply surface friction under the car (min mu if overlap)
+            if (track && car) {
+                glm::vec2 p = car->getPosition();
+                float mu = car->getDefaultMu();
+                for (const auto& s : track->surfaces) {
+                    if (pointInPolygon(p, s.polygon)) {
+                        mu = std::min(mu, s.mu);
+                    }
+                }
+                car->setSurfaceMu(mu);
+            }
             car->fixedUpdate(STEP);
             world->Step(STEP, V_IT, P_IT);
             telemetry->update(
@@ -478,8 +521,12 @@ void CarGame::update(float deltaTime) {
                 car->getSpeed(),
                 car->getSteer(),
                 car->getThrottle(),
-                car->getBrake()
+                car->getBrake(),
+                car->isHandbrake(),
+                car->getSurfaceMu(),
+                car->getLateralSpeed()
             );
+
             accumulator -= STEP;
         }
 
@@ -507,29 +554,38 @@ void CarGame::render() {
 
 
     debugRenderer().beginFrame();
-    // 4. РЕНДЕР МИРА (Box2D и Траектория)
-    renderTrackBackground();
-    if (showPhysics) {
-        box2dDebugDraw().currentMVP = projection;
-        // ВНИМАНИЕ: Убери beginFrame() из методов Box2DDebugDraw,
-        // иначе они будут затирать друг друга!
-        world->DebugDraw();
-    }
 
-    if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
-        const auto& tr = telemetry->trajectory;
-        for (size_t i = 1; i < tr.size(); ++i) {
-            debugRenderer().addLine(b2Vec2(tr[i-1].x, tr[i-1].y), b2Vec2(tr[i].x, tr[i].y));
+    const bool editing = (trackEditor && trackEditor->isEditing());
+    const glm::mat4& mvp = editing ? trackEditor->getProjectionMatrix() : projection;
+
+    // В режиме редактора — НЕ рисуем "игровую физику/траекторию", чтобы не мешала
+    if (!editing) {
+        renderTrackBackground();
+
+        if (showPhysics) {
+            box2dDebugDraw().currentMVP = mvp;
+            world->DebugDraw();
         }
-    }
-    // Сбрасываем накопленное (физику и траекторию) одним вызовом
-    debugRenderer().flush(projection, 1.0f, 1.0f, 1.0f, 1.0f);
 
-    // 5. РЕНДЕР ГРАФИКИ РЕДАКТОРА (Линии, точки)
-    if (trackEditor) {
-        trackEditor->setProjectionMatrix(projection);
+        if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
+            const auto& tr = telemetry->trajectory;
+            for (size_t i = 1; i < tr.size(); ++i) {
+                debugRenderer().addLine(b2Vec2(tr[i-1].x, tr[i-1].y), b2Vec2(tr[i].x, tr[i].y));
+            }
+        }
+
+        debugRenderer().flush(mvp, 1.0f, 1.0f, 1.0f, 1.0f);
+    } else {
+        // В редакторе очищаем накопленное (на всякий)
+        debugRenderer().flush(mvp, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    // Рендер редактора — ТОЛЬКО если он активен
+    if (trackEditor && trackEditor->isEditing()) {
         trackEditor->render();
     }
+
+
 
     // 6. ОТРИСОВКА ИНТЕРФЕЙСА (HUD и Окна редактора)
     if (showHud) {
@@ -545,6 +601,17 @@ void CarGame::render() {
                 telemetry->reset();
             }
         }
+
+        if (car && telemetry && ImGui::CollapsingHeader("Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto& s = telemetry->getLatest();
+            ImGui::Text("Pos: (%.2f, %.2f)", s.pos.x, s.pos.y);
+            ImGui::Text("Speed: %.2f m/s (%.1f km/h)", s.speed, s.speed * 3.6f);
+            ImGui::Text("Steer: %.2f  Throttle: %.2f  Brake: %.2f", s.steer, s.throttle, s.brake);
+            ImGui::Text("Handbrake: %s", s.handbrake ? "ON" : "OFF");
+            ImGui::Text("Surface mu: %.3f", s.mu);
+            ImGui::Text("Lateral speed (drift): %.2f m/s", s.vLat);
+        }
+
 
         // Вызываем UI редактора ВНУТРИ кадра ImGui
         if (trackEditor && trackEditor->isEditing()) {
@@ -579,13 +646,12 @@ void CarGame::handleInput() {
         } else {
             trackEditor->setMode(EditorMode::PLAY);
 
-            // ПЕРЕСОБИРАЕМ ФИЗИКУ
+            createArenaBounds();
             buildTrackCollision();
-
-            // ТЕЛЕПОРТИРУЕМ МАШИНУ (чтобы она не застряла в стене)
             if (car && track) {
                 car->reset(track->spawnPos, track->spawnYawRad);
             }
+
         }
     }
     f3Pressed = f3CurrentlyPressed;
@@ -652,11 +718,12 @@ void CarGame::handleInput() {
 }
 
 void CarGame::resize(int width, int height) {
-    (void)width;
-    (void)height;
-    // Update aspect ratio if needed
-    // For now, we keep the same orthographic projection regardless of window size
+    glViewport(0, 0, width, height);
+    if (trackEditor) {
+        trackEditor->setViewportSize(width, height);
+    }
 }
+
 
 void CarGame::shutdown() {
     // Вместо hud().shutdown() используем прямые вызовы очистки ImGui
@@ -853,7 +920,7 @@ void CarGame::renderHud() {
         std::cout << "Speed: " << car->getSpeed() << " m/s" << std::endl;
         std::cout << "Input: T=" << car->getThrottle() << " B=" << car->getBrake()
                   << " S=" << car->getSteer() << " HB=" << (car->isHandbrake() ? "ON" : "OFF") << std::endl;
-        std::cout << "Mu: " << car->getMuSurface() << " | Wheelbase: " << car->getParams().wheelbase << std::endl;
+        std::cout << "Mu: " << car->getSurfaceMu() << " | Wheelbase: " << car->getParams().wheelbase << std::endl;
         std::cout << "EngineF: " << car->getParams().engineForce << "N BrakeF: " << car->getParams().brakeForce << "N" << std::endl;
         std::cout << "Controls: W throttle | S brake | A/D steer | SPACE handbrake | R reset" << std::endl;
         std::cout << "================" << std::endl;
@@ -867,13 +934,15 @@ void CarGame::setEditorMode(bool enabled) {
 
     if (enabled) {
         trackEditor->setMode(EditorMode::EDIT_WALLS);
-        clearTrackCollision(); // опционально
+        clearTrackCollision();
     } else {
         trackEditor->setMode(EditorMode::PLAY);
-        buildTrackCollision();                 // <-- обязательно
+        createArenaBounds();
+        buildTrackCollision();
         if (car && track) car->reset(track->spawnPos, track->spawnYawRad);
     }
 }
+
 
 
 void CarGame::renderTrackBackground() {
