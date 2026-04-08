@@ -12,7 +12,17 @@ enum class EditorMode {
     EDIT_WALLS,
     EDIT_CHECKPOINTS,
     EDIT_SPAWN,
-    EDIT_SURFACES
+    EDIT_SURFACES,
+    EDIT_RACING_LINE,
+    EDIT_OUTER_BOUNDARY,  // внешняя граница трассы
+    EDIT_INNER_BOUNDARY,  // внутренняя граница (газон)
+    EDIT_START_FINISH     // линия старта/финиша
+};
+
+// Инструмент мыши (поведение), поверх EditorMode (что редактируем)
+enum class EditorTool {
+    SELECT_MOVE,
+    DRAW
 };
 
 enum class RenderMode {
@@ -56,6 +66,7 @@ public:
 
 private:
     EditorMode mode;
+    EditorTool tool = EditorTool::SELECT_MOVE;
     Track* currentTrack;
     bool isDirty;
 
@@ -72,6 +83,9 @@ private:
     int gridPow2 = 0;            // 0..8 (шаг = base / 2^gridPow2)
     float gridBase = 1.0f;       // базовый шаг (обычно 1.0)
     bool snapToGrid;
+
+    enum class GridStyle { LINES, DOTS };
+    GridStyle gridStyle = GridStyle::LINES;
 
     RenderMode currentRenderMode = RenderMode::SIMPLE_BOXES;
 
@@ -103,13 +117,53 @@ private:
     glm::vec2 lastMouseWorldPos;
     bool isDragging;
 
+    // AI
+    std::vector<glm::vec2> currentRacingLinePoints;
+    std::vector<glm::vec2> currentBoundaryPoints;   // строящаяся граница
+    // старт/финиш задаётся двумя кликами
+    bool hasStartFinishTemp = false;
+    glm::vec2 startFinishTempA{0,0};
+    void finishCurrentRacingLine();
+    void finishCurrentBoundary();
+    void renderRacingLine();
+    void renderBoundaries();
+
+    // ── Выделение и перетаскивание точек ─────────────────────────────────────
+    enum class SelType {
+        NONE,
+        WALL_PT,
+        SURFACE_PT,
+        RACING_PT,
+        RACING_HANDLE,
+        CHECKPOINT_PT,
+        OUTER_BOUNDARY_PT,
+        INNER_BOUNDARY_PT,
+        START_FINISH_A,
+        START_FINISH_B
+    };
+    SelType selObjType  = SelType::NONE;
+    int     selObjIdx   = -1;   // индекс объекта (стены/поверхности/…)
+    int     selPtIdx    = -1;   // индекс точки внутри объекта
+    bool    isDraggingPoint = false;
+    glm::vec2 dragStartWorld{0,0}; // мировая позиция при начале драга
+
+    bool    trySelectPoint(const glm::vec2& worldPos, float pickRadius);
+    void    applyDragPoint(const glm::vec2& newWorldPos);
+    // void    renderSelectionHandles();
+
+    // ── История (должна быть до SelType из-за порядка инициализации) ───────────
     struct HistoryState {
         Track trackState;
         std::string description;
     };
     std::vector<HistoryState> history;
-    int historyIndex;
+    int historyIndex = -1;
     static constexpr int MAX_HISTORY = 50;
+
+    // ── Сплайны ───────────────────────────────────────────────────────────────
+    bool  useSplines    = true;
+    int   splineSamples = 12;
+    float splineTension = 0.33f;
 
     void addHistoryState(const std::string& description);
     void finishCurrentWall();
@@ -128,6 +182,7 @@ private:
     void renderCheckpoints();
     void renderSpawnPoint();
     void renderSurfaces();
+    void renderSelectionHandles();
     void renderMouseCursor();
 
     void renderMainToolbar();

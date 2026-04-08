@@ -1,0 +1,30 @@
+1) Add these files to your project:
+   - BehavioralCloningController.h/.cpp
+   - ObservationDatasetLogger.h/.cpp
+
+2) In CarGame add members:
+   ObservationDatasetLogger datasetLogger;
+   bool datasetRecording = false;
+   bool useNeuralController = false;
+   std::string datasetPath = "dataset_bc.csv";
+   std::string modelPath = "bc_policy.json";
+
+3) In the AI update loop:
+   - continue building Observation exactly as in CarGame_updated.cpp
+   - if datasetRecording: log either player inputs or scripted AI outputs
+   - if useNeuralController and aiControllers[ci] points to BehavioralCloningController,
+     call controller->update(obs, STEP)
+
+4) Best first workflow:
+   - record player laps and/or scripted racing-line AI laps
+   - train with train_behavioral_cloning.py
+   - load bc_policy.json into BehavioralCloningController
+   - assign that controller to an AI car
+
+5) Recommended first training command:
+   python train_behavioral_cloning.py dataset_bc.csv --out bc_policy.json --plot bc_loss.png --hidden 128,128 --iters 200
+
+6) Important:
+   - keep target_handbrake unused at first
+   - start with steer/throttle/brake only
+   - record only decent laps, otherwise the policy learns noise

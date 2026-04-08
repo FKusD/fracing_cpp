@@ -23,6 +23,9 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include "DebugRenderer.h"
+#include "RandomController.h"
+#include "ObservationDatasetLogger.h"
+#include "BehavioralCloningController.h"
 
 namespace {
 GLuint compileShader(GLenum type, const char* src) {
@@ -64,6 +67,32 @@ GLuint linkProgram(GLuint vs, GLuint fs) {
     return p;
 }
 
+
+
+struct SensorDebugState {
+    std::vector<Observation> observations;
+    bool show = true;
+} gSensorDebug;
+
+static float cross2(const glm::vec2& a, const glm::vec2& b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+static glm::vec2 rotateLocal(const glm::vec2& forward, const glm::vec2& right, float angleRad) {
+    return std::cos(angleRad) * forward + std::sin(angleRad) * right;
+}
+
+static float raySegmentHit(const glm::vec2& ro, const glm::vec2& rd,
+                           const glm::vec2& a, const glm::vec2& b) {
+    const glm::vec2 s = b - a;
+    const float den = cross2(rd, s);
+    if (std::abs(den) < 1e-6f) return -1.0f;
+    const glm::vec2 delta = a - ro;
+    const float t = cross2(delta, s) / den;
+    const float u = cross2(delta, rd) / den;
+    if (t >= 0.0f && u >= 0.0f && u <= 1.0f) return t;
+    return -1.0f;
+}
 struct SimpleRenderer {
     GLuint vao = 0;
     GLuint vbo = 0;
@@ -310,17 +339,47 @@ Box2DDebugDraw& box2dDebugDraw() {
     return d;
 }
 
-static bool pointInPolygon(const glm::vec2& p, const std::vector<glm::vec2>& poly) {
-    if (poly.size() < 3) return false;
-    bool inside = false;
-    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
-        const glm::vec2& a = poly[i];
-        const glm::vec2& b = poly[j];
-        const bool intersect = ((a.y > p.y) != (b.y > p.y)) &&
-                               (p.x < (b.x - a.x) * (p.y - a.y) / ((b.y - a.y) + 1e-12f) + a.x);
-        if (intersect) inside = !inside;
+// static bool pointInPolygon(const glm::vec2& p, const std::vector<glm::vec2>& poly) {
+//     if (poly.size() < 3) return false;
+//     bool inside = false;
+//     for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+//         const glm::vec2& a = poly[i];
+//         const glm::vec2& b = poly[j];
+//         const bool intersect = ((a.y > p.y) != (b.y > p.y)) &&
+//                                (p.x < (b.x - a.x) * (p.y - a.y) / ((b.y - a.y) + 1e-12f) + a.x);
+//         if (intersect) inside = !inside;
+//     }
+//     return inside;
+// }
+
+static glm::vec2 rotateVec(glm::vec2 v, float a) {
+    float c = cosf(a), s = sinf(a);
+    return { c*v.x - s*v.y, s*v.x + c*v.y };
+}
+
+static void gridSlotPose(const StartGrid& g, int slotIndex, glm::vec2& outPos, float& outYaw) {
+    int cols = std::max(1, g.cols);
+    int rows = std::max(1, g.rows);
+    int total = rows * cols;
+
+    int idx = slotIndex % total;
+    int r = idx / cols; // 0..rows-1
+    int c = idx % cols; // 0..cols-1
+
+    // локальные оси: forward = +X, right = +Y (потом поворачиваем на yaw)
+    glm::vec2 forward = rotateVec({1,0}, g.yawRad);
+    glm::vec2 right   = rotateVec({0,1}, g.yawRad);
+
+    float colCenter = (cols - 1) * 0.5f;
+    float x = -r * g.rowSpacing;                 // назад по рядам
+    float y = (c - colCenter) * g.colSpacing;    // влево/вправо
+
+    if (g.serpentine && (r % 2 == 1)) {
+        y += g.colSpacing * 0.5f; // “шахматка”
     }
-    return inside;
+
+    outPos = g.origin + forward * x + right * y;
+    outYaw = g.yawRad;
 }
 
 
@@ -371,7 +430,7 @@ struct ImGuiHud {
 
 
 CarGame::CarGame()
-    : world(nullptr), gravity(0.0f, 0.0f), car(nullptr), telemetry(nullptr), track(nullptr),
+    : world(nullptr), gravity(0.0f, 0.0f), telemetry(nullptr), track(nullptr),
       window(nullptr), accumulator(0.0f), showHud(true), showPhysics(true), showTrajectory(true),
       trackPath("assets/default_track.json") {
 }
@@ -422,8 +481,28 @@ bool CarGame::initialize() {
     // Create car at spawn
     const glm::vec2 spawnPos = (trackOk && track) ? track->spawnPos : glm::vec2(0.0f, 0.0f);
     const float spawnYawRad = (trackOk && track) ? track->spawnYawRad : 0.0f;
-    car = std::make_unique<Car>(world, track->spawnPos);
-    car->reset(spawnPos, spawnYawRad);
+
+    cars.clear();
+    carIsAI.clear();
+    aiControllers.clear();
+    aiWaypointIndex.clear();
+    activeCarIndex  = 0;
+    spectatorMode   = false;
+    spectatorFree   = false;
+    spectatorTarget = 0;
+
+    const int numCars = 1; // <-- можно потом сделать настройкой / кнопкой в HUD
+    for (int i = 0; i < numCars; ++i) {
+        glm::vec2 p; float yaw;
+        gridSlotPose(track->startGrid, i, p, yaw);
+
+        auto c = std::make_unique<Car>(world, p);
+        c->reset(p, yaw);
+        cars.push_back(std::move(c));
+        carIsAI.push_back(false);
+        aiControllers.push_back(nullptr);
+        aiWaypointIndex.push_back(0);
+    }
 
     // Create telemetry system
     telemetry = std::make_unique<Telemetry>();
@@ -451,87 +530,266 @@ bool CarGame::initialize() {
 }
 
 void CarGame::update(float deltaTime) {
-    // if (ImGui::IsAnyItemHovered()) {
-    //     std::cout << "Мышь над кнопкой!" << std::endl;
-    // }
-
     static bool wasEditing = false;
     const bool nowEditing = (trackEditor && trackEditor->isEditing());
 
-    // Переход из редактора в игру
+    // Переход EDIT -> PLAY: пересобираем физику и ресетим машины
     if (wasEditing && !nowEditing) {
         createArenaBounds();
         buildTrackCollision();
-        if (car && track) {
-            car->reset(track->spawnPos, track->spawnYawRad);
+
+        if (track) {
+            for (int i = 0; i < (int)cars.size(); ++i) {
+                glm::vec2 p; float yaw;
+                gridSlotPose(track->startGrid, i, p, yaw);
+                cars[i]->reset(p, yaw);
+            }
+            if (telemetry) telemetry->reset();
         }
     }
     wasEditing = nowEditing;
 
-    // Обновляем редактор (позиция машины нужна для follow camera)
+    // Передаём редактору позицию активной машины (для follow camera)
     if (trackEditor) {
-        if (car) trackEditor->setCarPosition(car->getPosition());
+        if (Car* c = activeCar()) trackEditor->setCarPosition(c->getPosition());
         trackEditor->update(deltaTime);
     }
 
+    // В редакторе симуляцию не крутим
     if (trackEditor && trackEditor->isEditing()) {
-        trackEditor->update(deltaTime);
         return;
     }
 
+    // fixed-step симуляция (стоп на паузе)
+    if (isPaused) { updateCamera(); return; }
+    accumulator += deltaTime;
+    while (accumulator >= STEP) {
+        handleInput();
 
-    if (world->GetBodyCount() == 0) return;
+        // 1) обновляем mu под каждой машиной
+        if (track) {
+            for (auto& c : cars) {
+                glm::vec2 p = c->getPosition();
+                float mu = c->getDefaultMu();
 
-    world->Step(deltaTime, 8, 3);
-
-    if (!trackEditor || !trackEditor->isEditing()) {
-        // handleInput();
-        glm::vec2 p = car->getPosition();
-        float mu = car->getDefaultMu(); // базовое покрытие
-
-        // Если поверхностей несколько и они перекрываются:
-        // 1) можно брать "самую скользкую" (min), чтобы было предсказуемо
-        for (const auto& s : track->surfaces) {
-            if (pointInPolygon(p, s.polygon)) {
-                mu = std::min(mu, s.mu);
-            }
-        }
-
-        car->setSurfaceMu(mu);
-        // Fixed timestep update
-        accumulator += deltaTime;
-        while (accumulator >= STEP) {
-            handleInput();
-            // Apply surface friction under the car (min mu if overlap)
-            if (track && car) {
-                glm::vec2 p = car->getPosition();
-                float mu = car->getDefaultMu();
                 for (const auto& s : track->surfaces) {
                     if (pointInPolygon(p, s.polygon)) {
                         mu = std::min(mu, s.mu);
                     }
                 }
-                car->setSurfaceMu(mu);
+                c->setSurfaceMu(mu);
             }
-            car->fixedUpdate(STEP);
-            world->Step(STEP, V_IT, P_IT);
-            telemetry->update(
-                STEP,
-                car->getPosition(),
-                car->getSpeed(),
-                car->getSteer(),
-                car->getThrottle(),
-                car->getBrake(),
-                car->isHandbrake(),
-                car->getSurfaceMu(),
-                car->getLateralSpeed()
-            );
-
-            accumulator -= STEP;
         }
 
-        updateCamera();
+        // 2) строим Observation и обновляем каждую машину
+        if ((int)gSensorDebug.observations.size() != (int)cars.size())
+            gSensorDebug.observations.resize(cars.size());
+
+        auto buildObservation = [&](int ci) -> Observation {
+            Observation obs;
+            if (ci < 0 || ci >= (int)cars.size() || !cars[ci]) return obs;
+
+            Car* c = cars[ci].get();
+            obs.pos          = c->getPosition();
+            obs.speed        = c->getSpeed();
+            obs.speedForward = c->getSpeed();
+            obs.speedAbs     = std::abs(c->getSpeed());
+            obs.yaw          = c->getAngleRad();
+            obs.steer        = c->getSteer();
+            obs.surfaceMu    = c->getSurfaceMu();
+
+            const glm::vec2 forward(std::cos(obs.yaw), std::sin(obs.yaw));
+            const glm::vec2 right(-std::sin(obs.yaw), std::cos(obs.yaw));
+
+            constexpr float kHalfLen = 0.40f;
+            constexpr float kHalfWid = 0.20f;
+            const std::array<glm::vec2, Observation::kCornerCount> corners = {{
+                obs.pos + forward * kHalfLen - right * kHalfWid,
+                obs.pos + forward * kHalfLen + right * kHalfWid,
+                obs.pos - forward * kHalfLen - right * kHalfWid,
+                obs.pos - forward * kHalfLen + right * kHalfWid
+            }};
+            const std::array<float, Observation::kRaysPerCorner> rayAngles = {{
+                -1.5707963f, -1.0471976f, -0.5235988f, -0.1745329f,
+                 0.1745329f,  0.5235988f,  1.0471976f,  1.5707963f
+            }};
+            const float maxRayLen = 18.0f;
+
+            auto testSeg = [&](const glm::vec2& ro, const glm::vec2& rd, float curBest,
+                               const glm::vec2& a, const glm::vec2& b) {
+                float t = raySegmentHit(ro, rd, a, b);
+                return (t >= 0.0f && t < curBest) ? t : curBest;
+            };
+
+            int rayIdx = 0;
+            for (int cornerIdx = 0; cornerIdx < Observation::kCornerCount; ++cornerIdx) {
+                const glm::vec2 ro = corners[cornerIdx];
+                for (float ang : rayAngles) {
+                    glm::vec2 rd = rotateLocal(forward, right, ang);
+                    float best = maxRayLen;
+
+                    if (track) {
+                        const auto testPolyline = [&](const std::vector<glm::vec2>& poly, bool closed) {
+                            if (poly.size() < 2) return;
+                            const int n = (int)poly.size();
+                            const int segs = closed ? n : (n - 1);
+                            for (int i = 0; i < segs; ++i) {
+                                best = testSeg(ro, rd, best, poly[i], poly[(i + 1) % n]);
+                            }
+                        };
+
+                        testPolyline(track->outerBoundary, true);
+                        testPolyline(track->innerBoundary, true);
+
+                        for (const auto& wall : track->walls) {
+                            const int wn = (int)wall.vertices.size();
+                            if (wn < 2) continue;
+                            for (int i = 0; i < wn - 1; ++i) {
+                                const glm::vec2 a = wall.vertices[i];
+                                const glm::vec2 b = wall.vertices[i + 1];
+                                glm::vec2 seg = b - a;
+                                float len = glm::length(seg);
+                                if (len < 1e-4f) continue;
+                                glm::vec2 tang = seg / len;
+                                glm::vec2 norm(-tang.y, tang.x);
+                                glm::vec2 off = norm * (0.5f * wall.thickness);
+                                const glm::vec2 p0 = a + off;
+                                const glm::vec2 p1 = b + off;
+                                const glm::vec2 p2 = b - off;
+                                const glm::vec2 p3 = a - off;
+                                best = testSeg(ro, rd, best, p0, p1);
+                                best = testSeg(ro, rd, best, p1, p2);
+                                best = testSeg(ro, rd, best, p2, p3);
+                                best = testSeg(ro, rd, best, p3, p0);
+                            }
+                        }
+                    }
+
+                    obs.rayDistance[rayIdx] = std::clamp(best / maxRayLen, 0.0f, 1.0f);
+                    obs.rayStart[rayIdx] = ro;
+                    obs.rayEnd[rayIdx] = ro + rd * best;
+                    ++rayIdx;
+                }
+            }
+
+            if (track && track->racingLine.size() >= 2) {
+                const int ctrlN = (int)track->racingLine.size();
+                if (splineCacheVersion != ctrlN) rebuildSplineCache();
+                const std::vector<glm::vec2>& line = splineCache.size() >= 2 ? splineCache : track->racingLine;
+                const int N = (int)line.size();
+                if (N >= 2) {
+                    int nearest = (ci < (int)aiWaypointIndex.size()) ? aiWaypointIndex[ci] : 0;
+                    nearest = std::clamp(nearest, 0, N - 1);
+                    float bestD2 = 1e30f;
+                    const int window = std::min(N, 160);
+                    for (int di = 0; di < window; ++di) {
+                        int idx = (nearest + di) % N;
+                        glm::vec2 d = line[idx] - obs.pos;
+                        float d2 = glm::dot(d, d);
+                        if (d2 < bestD2) {
+                            bestD2 = d2;
+                            nearest = idx;
+                        } else if (di > 8 && d2 > bestD2 * 6.0f) {
+                            break;
+                        }
+                    }
+                    obs.progress = (float)nearest / (float)std::max(1, N);
+                    obs.distToCenterline = std::sqrt(std::max(0.0f, bestD2));
+
+                    const std::array<float, 3> previewDist = {{
+                        std::clamp(4.0f  + obs.speedAbs * 0.18f, 3.0f, 10.0f),
+                        std::clamp(8.0f  + obs.speedAbs * 0.25f, 6.0f, 18.0f),
+                        std::clamp(14.0f + obs.speedAbs * 0.33f, 10.0f, 28.0f)
+                    }};
+
+                    for (int pi = 0; pi < 3; ++pi) {
+                        glm::vec2 target = line[(nearest + 1) % N];
+                        float accum = 0.0f;
+                        for (int di = 1; di < N; ++di) {
+                            int a = (nearest + di - 1) % N;
+                            int b = (nearest + di) % N;
+                            accum += glm::length(line[b] - line[a]);
+                            target = line[b];
+                            if (accum >= previewDist[pi]) break;
+                        }
+                        glm::vec2 rel = target - obs.pos;
+                        float x = glm::dot(rel, forward);
+                        float y = glm::dot(rel, right);
+                        obs.headingError[pi] = std::atan2(y, std::max(0.1f, x));
+                        float denom = x * x + y * y;
+                        obs.curvature[pi] = (denom > 1e-4f) ? (2.0f * y / denom) : 0.0f;
+                    }
+                }
+            }
+
+            if (track) {
+                bool hasOuter = track->outerBoundary.size() >= 3;
+                bool hasInner = track->innerBoundary.size() >= 3;
+                obs.offTrack = (hasOuter && !pointInPolygon(obs.pos, track->outerBoundary)) ||
+                               (hasInner &&  pointInPolygon(obs.pos, track->innerBoundary));
+            }
+            return obs;
+        };
+
+        for (int ci = 0; ci < (int)cars.size(); ++ci) {
+            Observation obs = buildObservation(ci);
+            gSensorDebug.observations[ci] = obs;
+
+            if (carIsAI[ci]) {
+                VehicleControls ctrl{};
+
+                if (aiControllers[ci]) {
+                    ctrl = aiControllers[ci]->update(obs, STEP);
+                } else if (track && track->racingLine.size() >= 2) {
+                    ctrl = computeRacingLineControls(ci);
+                }
+
+                cars[ci]->setControls(ctrl.throttle, ctrl.brake, ctrl.steer, ctrl.handbrake);
+
+                if (datasetRecording_ && datasetLogger_.isOpen() && !useNeuralController_ && ci == 0) {
+                    datasetLogger_.logSample(obs, ctrl, STEP, ci, true, "scripted_ai");
+                }
+                if (datasetRecording_ && datasetLogger_.isOpen() && !useNeuralController_ && ci == activeCarIndex && !carIsAI[ci]) {
+                    VehicleControls playerCtrl{};
+                    playerCtrl.throttle  = cars[ci]->getThrottle();
+                    playerCtrl.brake     = cars[ci]->getBrake();
+                    playerCtrl.steer     = cars[ci]->getSteer();
+                    playerCtrl.handbrake = cars[ci]->isHandbrake();
+
+                    datasetLogger_.logSample(obs, playerCtrl, STEP, ci, false, "player");
+                }
+            }
+            cars[ci]->fixedUpdate(STEP);
+        }
+
+        // 3) шаг Box2D
+        world->Step(STEP, V_IT, P_IT);
+
+        // 4) телеметрия только активной машины (пока)
+        if (telemetry) {
+            if (Car* c = activeCar()) {
+                telemetry->update(
+                    STEP,
+                    c->getPosition(),
+                    c->getSpeed(),
+                    c->getSteer(),
+                    c->getThrottle(),
+                    c->getBrake(),
+                    c->isHandbrake(),
+                    c->getSurfaceMu(),
+                    c->getLateralSpeed()
+                );
+            }
+        }
+
+        accumulator -= STEP;
     }
+
+    // Вне трассы/штрафы и тайминг считаем по кадру
+    updateOffTrack(deltaTime);
+    updateLapTiming(deltaTime);
+
+    updateCamera();
 }
 
 void CarGame::render() {
@@ -552,6 +810,40 @@ void CarGame::render() {
     glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+    // ── Меню паузы ─────────────────────────────────────────────────────
+    if (isPaused && !(trackEditor && trackEditor->isEditing())) {
+        ImGuiIO& _io = ImGui::GetIO();
+        ImVec2 center(_io.DisplaySize.x * 0.5f, _io.DisplaySize.y * 0.5f);
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_Always);
+        ImGuiWindowFlags pf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove
+                            | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
+        ImGui::Begin("##pause", nullptr, pf);
+        float tw = ImGui::CalcTextSize("--- PAUSE ---").x;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+        ImGui::TextColored(ImVec4(1.0f,0.85f,0.2f,1.0f), "--- PAUSE ---");
+        ImGui::Separator(); ImGui::Spacing();
+        float bw = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Button("Continue  (P / ESC)", ImVec2(bw,0))) isPaused = false;
+        ImGui::Spacing();
+        if (ImGui::Button("Reset all cars", ImVec2(bw,0))) {
+            resetAllCarsToGrid();
+            if (telemetry) telemetry->reset();
+            isPaused = false;
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        if (!showQuitConfirm) {
+            if (ImGui::Button("Quit game...", ImVec2(bw,0))) showQuitConfirm = true;
+        } else {
+            ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Are you sure? Unsaved data will be lost.");
+            float hw = (bw - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            if (ImGui::Button("Yes, quit", ImVec2(hw,0)))
+                glfwSetWindowShouldClose(glfwGetCurrentContext(), GLFW_TRUE);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(hw,0))) showQuitConfirm = false;
+        }
+        ImGui::End();
+    }
 
     debugRenderer().beginFrame();
 
@@ -568,9 +860,65 @@ void CarGame::render() {
         }
 
         if (showTrajectory && telemetry && telemetry->trajectory.size() >= 2) {
-            const auto& tr = telemetry->trajectory;
+            // Speed heatmap: blue(slow)->green->red(fast) — ONE draw call via colored batch
+            const auto& tr   = telemetry->trajectory;
+            const auto& spds = telemetry->speeds;
+            float maxSpd = 1.0f;
+            for (float s : spds) if (s > maxSpd) maxSpd = s;
             for (size_t i = 1; i < tr.size(); ++i) {
-                debugRenderer().addLine(b2Vec2(tr[i-1].x, tr[i-1].y), b2Vec2(tr[i].x, tr[i].y));
+                float nt = (i < spds.size()) ? std::clamp(spds[i]/maxSpd, 0.0f, 1.0f) : 0.5f;
+                float r  = std::clamp(2.0f*nt - 1.0f, 0.0f, 1.0f);
+                float g  = 1.0f - std::abs(2.0f*nt - 1.0f);
+                float b  = std::clamp(1.0f - 2.0f*nt, 0.0f, 1.0f);
+                debugRenderer().addColoredLine(
+                    b2Vec2(tr[i-1].x,tr[i-1].y), b2Vec2(tr[i].x,tr[i].y),
+                    r, g, b, 0.85f);
+            }
+            debugRenderer().flushColored(mvp);  // single GPU draw call
+        }
+
+        // Racing line — Bezier (авто-касательные если нет ручек)
+        if (track && track->racingLine.size() >= 2) {
+            const auto& ctrl = track->racingLine;
+            const int RLN = (int)ctrl.size();
+            bool hasH = ((int)track->racingLineOutHandle.size() == RLN);
+            std::vector<glm::vec2> autoH;
+            if (!hasH) {
+                autoH.resize(RLN);
+                const float tension = 0.33f;
+                for (int i = 0; i < RLN; ++i)
+                    autoH[i] = (ctrl[(i+1)%RLN] - ctrl[(i-1+RLN)%RLN]) * tension;
+            }
+            auto bezRL = [](const glm::vec2& p0,const glm::vec2& p1,
+                            const glm::vec2& p2,const glm::vec2& p3,float t){
+                float u=1-t; return p0*(u*u*u)+p1*(3*u*u*t)+p2*(3*u*t*t)+p3*(t*t*t);
+            };
+            for (int i = 0; i < RLN; ++i) {
+                int j=(i+1)%RLN;
+                const glm::vec2& hi=hasH?track->racingLineOutHandle[i]:autoH[i];
+                const glm::vec2& hj=hasH?track->racingLineOutHandle[j]:autoH[j];
+                glm::vec2 prev=ctrl[i];
+                for (int s=1;s<=12;++s){
+                    float t=(float)s/12.0f;
+                    glm::vec2 cur=bezRL(ctrl[i],ctrl[i]+hi,ctrl[j]-hj,ctrl[j],t);
+                    debugRenderer().addLine(b2Vec2(prev.x,prev.y),b2Vec2(cur.x,cur.y));
+                    prev=cur;
+                }
+            }
+            debugRenderer().flush(mvp, 1.0f, 0.88f, 0.0f, 0.40f);
+        }
+
+        if (gSensorDebug.show && activeCarIndex >= 0 && activeCarIndex < (int)gSensorDebug.observations.size()) {
+            const Observation& obs = gSensorDebug.observations[activeCarIndex];
+            for (int i = 0; i < Observation::kRayCount; ++i) {
+                float t = obs.rayDistance[i];
+                glm::vec3 color = (t < 0.999f) ? glm::vec3(1.0f, 0.2f, 0.2f) : glm::vec3(0.9f, 0.9f, 0.2f);
+                debugRenderer().addLine(
+                    b2Vec2(obs.rayStart[i].x, obs.rayStart[i].y),
+                    b2Vec2(obs.rayEnd[i].x,   obs.rayEnd[i].y)
+                );
+                debugRenderer().flush(mvp, color.r, color.g, color.b, 1.0f);
+                debugRenderer().beginFrame();
             }
         }
 
@@ -585,7 +933,7 @@ void CarGame::render() {
         trackEditor->render();
     }
 
-
+    Car* car = activeCar();
 
     // 6. ОТРИСОВКА ИНТЕРФЕЙСА (HUD и Окна редактора)
     if (showHud) {
@@ -610,6 +958,85 @@ void CarGame::render() {
             ImGui::Text("Handbrake: %s", s.handbrake ? "ON" : "OFF");
             ImGui::Text("Surface mu: %.3f", s.mu);
             ImGui::Text("Lateral speed (drift): %.2f m/s", s.vLat);
+            ImGui::Text("BC: F6 start rec | F7 stop rec | F8 load model");
+            ImGui::Text("REC: %s", datasetRecording_ ? "ON" : "OFF");
+            ImGui::Text("CTRL: %s", useNeuralController_ ? "BC" : "SCRIPTED");
+            ImGui::Text("Dataset: %s", datasetPath_.c_str());
+            ImGui::Text("Model: %s", modelPath_.c_str());
+            if (activeCarIndex >= 0 && activeCarIndex < (int)gSensorDebug.observations.size()) {
+                const Observation& obs = gSensorDebug.observations[activeCarIndex];
+                ImGui::Separator();
+                ImGui::Text("Sensors: rays=%d  offTrack=%s  centerDist=%.2f",
+                            Observation::kRayCount, obs.offTrack ? "YES" : "no", obs.distToCenterline);
+                ImGui::Text("Heading err: %.2f  %.2f  %.2f",
+                            obs.headingError[0], obs.headingError[1], obs.headingError[2]);
+                ImGui::Text("Curvature:   %.3f  %.3f  %.3f",
+                            obs.curvature[0], obs.curvature[1], obs.curvature[2]);
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Lap Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (!track || track->startFinish.start == track->startFinish.end) {
+                ImGui::TextColored(ImVec4(1.0f,0.6f,0.2f,1.0f), "Start/Finish not set.");
+                ImGui::Text("Editor -> Start/Finish -> Draw -> 2 clicks");
+            } else {
+                // ── Текущий круг (крупно) ──────────────────────────────
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,1.0f,1.0f,1.0f));
+                ImGui::Text("Lap:   %s", formatTime(timing.lapTime).c_str());
+                ImGui::PopStyleColor();
+                ImGui::TextDisabled("Last:%-12s  Best:%s",
+                    formatLastTime(timing.lastLapTime).c_str(),
+                    formatLastTime(timing.bestLapTime).c_str());
+
+                // ── Сектора с дельтой ──────────────────────────────────
+                if (!timing.currentSplits.empty()) {
+                    ImGui::Separator();
+                    int nSec = (int)timing.currentSplits.size();
+                    for (int i = 0; i < nSec; ++i) {
+                        float cur = timing.currentSplits[i];
+                        float lst = timing.lastSplits[i];
+                        float bst = timing.bestSplits[i];
+                        bool active = (timing.lastPassedSector == i);
+
+                        // Заголовок S1 / S2 / ...
+                        ImVec4 hcol = active ? ImVec4(1,1,0.3f,1) : ImVec4(0.6f,0.6f,0.6f,1);
+                        ImGui::TextColored(hcol, "S%d", i+1);
+                        ImGui::SameLine(36);
+
+                        // Текущее
+                        if (cur > 0.0f)
+                            ImGui::Text("%s", formatTime(cur).c_str());
+                        else
+                            ImGui::TextDisabled("--:--.---");
+                        ImGui::SameLine(130);
+
+                        // Дельта последнего к лучшему
+                        if (lst > 0.0f && bst > 0.0f) {
+                            float d = lst - bst;
+                            ImVec4 dc = (d <= 0.001f) ? ImVec4(0.3f,1,0.3f,1)
+                                                      : ImVec4(1,0.4f,0.4f,1);
+                            ImGui::TextColored(dc, "%+.3fs", d);
+                        } else if (lst > 0.0f) {
+                            ImGui::TextDisabled("%s", formatTime(lst).c_str());
+                        } else {
+                            ImGui::TextDisabled("  ---");
+                        }
+                        ImGui::SameLine(200);
+                        ImGui::TextDisabled("%s", bst>0 ? formatTime(bst).c_str() : "best:---");
+                    }
+                } else {
+                    ImGui::TextDisabled("No sectors - add sector polygons in editor");
+                }
+
+                // Off-track статус
+                if (!carPenalties.empty() && carPenalties[0].isOffTrack) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1,0.25f,0.25f,1), "! OFF TRACK");
+                    if (carPenalties[0].penaltySeconds > 0.0f)
+                        ImGui::TextColored(ImVec4(1,0.5f,0,1), "Penalty: +%.0f sec",
+                                           carPenalties[0].penaltySeconds);
+                }
+            }
         }
 
 
@@ -620,6 +1047,134 @@ void CarGame::render() {
         }
         ImGui::End();
     }
+
+    // ─── Окно "Cars" ──────────────────────────────────────────────────────────
+    {
+        ImGui::SetNextWindowSizeConstraints(ImVec2(310, 60), ImVec2(430, 480));
+        ImGui::Begin("Cars", nullptr, 0);
+
+        // ── Строка статуса ──
+        if (spectatorMode) {
+            if (spectatorFree)
+                ImGui::TextColored({0.4f,0.8f,1.0f,1.0f}, "Spectator  [Free cam  WASD]");
+            else
+                ImGui::TextColored({0.4f,0.8f,1.0f,1.0f}, "Spectator  -> #%d", spectatorTarget);
+        } else {
+            bool ai = activeCarIndex < (int)carIsAI.size() && carIsAI[activeCarIndex];
+            ImGui::Text("Driving: #%d  [%s]", activeCarIndex, ai ? "AI" : "Player");
+        }
+
+        float btnX = ImGui::GetContentRegionAvail().x - 88;
+        ImGui::SameLine(btnX < 10 ? 10 : btnX);
+        if (ImGui::SmallButton(spectatorMode ? "Exit Spec" : "Spectator")) {
+            spectatorMode   = !spectatorMode;
+            spectatorFree   = false;
+            spectatorTarget = activeCarIndex;
+        }
+        ImGui::Separator();
+
+        // ── Кнопки парка ──
+        if (ImGui::Button("+AI"))      addAICar();
+        ImGui::SameLine();
+        if (ImGui::Button("-AI"))      removeLastAICar();
+        ImGui::SameLine();
+        if (ImGui::Button("Reset All")) resetAllCarsToGrid();
+        if (spectatorMode) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(spectatorFree ? "Lock" : "Free cam"))
+                spectatorFree = !spectatorFree;
+        }
+        ImGui::Separator();
+
+        // ── Список со скроллом ──
+        float listH = std::max(30.0f, ImGui::GetContentRegionAvail().y - 4);
+        ImGui::BeginChild("##carlist", ImVec2(0, listH), true);
+
+        for (int i = 0; i < (int)cars.size(); ++i) {
+            ImGui::PushID(i);
+
+            bool ai    = i < (int)carIsAI.size() && carIsAI[i];
+            bool hilit = spectatorMode ? (!spectatorFree && i == spectatorTarget)
+                                       : (i == activeCarIndex);
+
+            float spd_kmh = std::abs(cars[i]->getSpeed()) * 3.6f;
+            glm::vec2 pos = cars[i]->getPosition();
+
+            // Цвет: игрок-зелёный, AI-белый
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ai ? ImVec4(1,1,1,1) : ImVec4(0.3f,1.0f,0.5f,1.0f));
+
+            char label[96];
+            snprintf(label, sizeof(label), "%s#%-2d  %3.0f km/h  (%4.0f,%4.0f)",
+                     ai ? "[AI] " : "[P]  ", i, spd_kmh, pos.x, pos.y);
+
+            if (ImGui::Selectable(label, hilit, ImGuiSelectableFlags_AllowDoubleClick)) {
+                // Одиночный — следить камерой
+                spectatorTarget = i;
+                spectatorFree   = false;
+                if (!spectatorMode) activeCarIndex = i;
+                // Двойной — взять управление
+                if (ImGui::IsMouseDoubleClicked(0)) {
+                    carIsAI[i]     = false;
+                    spectatorMode  = false;
+                    activeCarIndex = i;
+                    if (i < (int)aiWaypointIndex.size()) aiWaypointIndex[i] = 0;
+                    if (telemetry) telemetry->reset();
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Dbl-click: take control\nRMB: menu");
+
+            // ── Контекстное меню ──
+            if (ImGui::BeginPopupContextItem("##ctx")) {
+                if (ImGui::MenuItem("Take control (Player)")) {
+                    carIsAI[i]     = false;
+                    spectatorMode  = false;
+                    activeCarIndex = i;
+                    if (i < (int)aiWaypointIndex.size()) aiWaypointIndex[i] = 0;
+                    if (telemetry) telemetry->reset();
+                }
+                if (!ai && ImGui::MenuItem("Hand to AI")) {
+                    carIsAI[i] = true;
+                    if (i >= (int)aiWaypointIndex.size())
+                        aiWaypointIndex.resize(i+1, 0);
+                    aiWaypointIndex[i] = 0;
+                    if (activeCarIndex == i) spectatorMode = true;
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Follow cam")) {
+                    spectatorTarget = i;
+                    spectatorFree   = false;
+                    spectatorMode   = true;
+                }
+                if (ImGui::MenuItem("Reset car")) {
+                    glm::vec2 p; float yaw;
+                    if (track) gridSlotPose(track->startGrid, i, p, yaw);
+                    else { p = {(float)i*2.5f, 0}; yaw = 0; }
+                    cars[i]->reset(p, yaw);
+                    if (i < (int)aiWaypointIndex.size()) aiWaypointIndex[i] = 0;
+                }
+                if (ai && ImGui::MenuItem("Remove")) {
+                    cars.erase(cars.begin() + i);
+                    carIsAI.erase(carIsAI.begin() + i);
+                    aiControllers.erase(aiControllers.begin() + i);
+                    if (i < (int)aiWaypointIndex.size())
+                        aiWaypointIndex.erase(aiWaypointIndex.begin() + i);
+                    activeCarIndex  = std::min(activeCarIndex,  (int)cars.size()-1);
+                    spectatorTarget = std::min(spectatorTarget, (int)cars.size()-1);
+                    ImGui::EndPopup(); ImGui::PopStyleColor(); ImGui::PopID();
+                    break;
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::End();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // 7. ЗАВЕРШЕНИЕ КАДРА IMGUI
     ImGui::Render();
@@ -636,6 +1191,20 @@ void CarGame::handleInput() {
         return;
     }
 
+    // ESC / P — пауза (только вне редактора)
+    {
+        static bool escWas = false, pWas = false;
+        bool escNow = glfwGetKey(currentWindow, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+        bool pNow   = glfwGetKey(currentWindow, GLFW_KEY_P)      == GLFW_PRESS;
+        if (!(trackEditor && trackEditor->isEditing())) {
+            if ((escNow && !escWas) || (pNow && !pWas)) {
+                if (showQuitConfirm) showQuitConfirm = false;
+                else isPaused = !isPaused;
+            }
+        }
+        escWas = escNow; pWas = pNow;
+    }
+
     // F3 - переключение режима редактора
     static bool f3Pressed = false;
     bool f3CurrentlyPressed = glfwGetKey(currentWindow, GLFW_KEY_F3) == GLFW_PRESS;
@@ -648,9 +1217,9 @@ void CarGame::handleInput() {
 
             createArenaBounds();
             buildTrackCollision();
-            if (car && track) {
-                car->reset(track->spawnPos, track->spawnYawRad);
-            }
+            // if (car && track) {
+            //     car->reset(track->spawnPos, track->spawnYawRad);
+            // }
 
         }
     }
@@ -677,33 +1246,88 @@ void CarGame::handleInput() {
     }
     f2Pressed = f2CurrentlyPressed;
 
+    // F6/F7/F8 — behavioral cloning pipeline
+    static bool f6Pressed = false;
+    static bool f7Pressed = false;
+    static bool f8Pressed = false;
+
+    bool f6Now = glfwGetKey(currentWindow, GLFW_KEY_F6) == GLFW_PRESS;
+    bool f7Now = glfwGetKey(currentWindow, GLFW_KEY_F7) == GLFW_PRESS;
+    bool f8Now = glfwGetKey(currentWindow, GLFW_KEY_F8) == GLFW_PRESS;
+
+    if (f6Now && !f6Pressed) {
+        std::string err;
+        if (!datasetLogger_.open(datasetPath_, &err)) {
+            std::cerr << "Dataset open failed: " << err << std::endl;
+        } else {
+            datasetRecording_ = true;
+            useNeuralController_ = false;
+            std::cout << "Dataset recording ON -> " << datasetPath_ << std::endl;
+        }
+    }
+    f6Pressed = f6Now;
+
+    if (f7Now && !f7Pressed) {
+        datasetRecording_ = false;
+        datasetLogger_.close();
+        std::cout << "Dataset recording OFF" << std::endl;
+    }
+    f7Pressed = f7Now;
+
+    if (f8Now && !f8Pressed) {
+        if (!aiControllers.empty()) {
+            auto bc = std::make_unique<BehavioralCloningController>();
+            std::string err;
+            if (!bc->loadModel(modelPath_, &err)) {
+                std::cerr << "BC model load failed: " << err << std::endl;
+            } else {
+                aiControllers[0] = std::move(bc);
+                carIsAI[0] = true;
+                useNeuralController_ = true;
+                datasetRecording_ = false;
+                datasetLogger_.close();
+                std::cout << "BC model loaded: " << modelPath_ << std::endl;
+            }
+        }
+    }
+    f8Pressed = f8Now;
+
     // Get control inputs
-    float throttle = 0.0f;
-    float brake = 0.0f;
-    float steer = 0.0f;
-    bool handbrake = false;
+    if (spectatorMode) {
+        // Spectator free cam — WASD двигают камеру (обрабатывается в updateCamera)
+        // Tab: переключить за кем следим
+        static bool tabSpSpec = false;
+        bool tabSpNow = glfwGetKey(currentWindow, GLFW_KEY_TAB) == GLFW_PRESS;
+        if (tabSpNow && !tabSpSpec && !cars.empty() && !spectatorFree) {
+            spectatorTarget = (spectatorTarget + 1) % (int)cars.size();
+        }
+        tabSpSpec = tabSpNow;
+    } else {
+        // Обычный Tab: переключить активную машину
+        static bool tabPressed = false;
+        bool tabNow = glfwGetKey(currentWindow, GLFW_KEY_TAB) == GLFW_PRESS;
+        if (tabNow && !tabPressed && !cars.empty()) {
+            activeCarIndex = (activeCarIndex + 1) % (int)cars.size();
+            spectatorTarget = activeCarIndex;
+            if (telemetry) telemetry->reset();
+        }
+        tabPressed = tabNow;
 
-    if (glfwGetKey(currentWindow, GLFW_KEY_W) == GLFW_PRESS ||
-        glfwGetKey(currentWindow, GLFW_KEY_UP) == GLFW_PRESS) {
-        throttle = 1.0f;
-    }
-    if (glfwGetKey(currentWindow, GLFW_KEY_S) == GLFW_PRESS ||
-        glfwGetKey(currentWindow, GLFW_KEY_DOWN) == GLFW_PRESS) {
-        brake = 1.0f;
-    }
+        float throttle = 0.0f, brake = 0.0f, steer = 0.0f;
+        bool handbrake = false;
 
-    if (glfwGetKey(currentWindow, GLFW_KEY_A) == GLFW_PRESS ||
-        glfwGetKey(currentWindow, GLFW_KEY_LEFT) == GLFW_PRESS) {
-        steer += 1.0f;
-    }
-    if (glfwGetKey(currentWindow, GLFW_KEY_D) == GLFW_PRESS ||
-        glfwGetKey(currentWindow, GLFW_KEY_RIGHT) == GLFW_PRESS) {
-        steer -= 1.0f;
-    }
+        if (glfwGetKey(currentWindow, GLFW_KEY_W) == GLFW_PRESS ||
+            glfwGetKey(currentWindow, GLFW_KEY_UP) == GLFW_PRESS)    throttle = 1.0f;
+        if (glfwGetKey(currentWindow, GLFW_KEY_S) == GLFW_PRESS ||
+            glfwGetKey(currentWindow, GLFW_KEY_DOWN) == GLFW_PRESS)  brake = 1.0f;
+        if (glfwGetKey(currentWindow, GLFW_KEY_A) == GLFW_PRESS ||
+            glfwGetKey(currentWindow, GLFW_KEY_LEFT) == GLFW_PRESS)  steer += 1.0f;
+        if (glfwGetKey(currentWindow, GLFW_KEY_D) == GLFW_PRESS ||
+            glfwGetKey(currentWindow, GLFW_KEY_RIGHT) == GLFW_PRESS) steer -= 1.0f;
+        handbrake = glfwGetKey(currentWindow, GLFW_KEY_SPACE) == GLFW_PRESS;
 
-    handbrake = glfwGetKey(currentWindow, GLFW_KEY_SPACE) == GLFW_PRESS;
-
-    car->setControls(throttle, brake, steer, handbrake);
+        if (Car* car = activeCar()) car->setControls(throttle, brake, steer, handbrake);
+    }
 
     // Reset car on 'R' press
     static bool rPressed = false;
@@ -711,8 +1335,10 @@ void CarGame::handleInput() {
     if (rCurrentlyPressed && !rPressed) {
         const glm::vec2 spawnPos = (track ? track->spawnPos : glm::vec2(0.0f, 0.0f));
         const float spawnYawRad = (track ? track->spawnYawRad : 0.0f);
-        car->reset(spawnPos, spawnYawRad);
-        telemetry->reset();
+        if (Car* car = activeCar()) {
+            car->reset(spawnPos, spawnYawRad);
+        }
+        if (telemetry) telemetry->reset();
     }
     rPressed = rCurrentlyPressed;
 }
@@ -739,7 +1365,7 @@ void CarGame::shutdown() {
         world = nullptr;
     }
 
-    car.reset();
+    cars.clear();
     telemetry.reset();
     track.reset();
 }
@@ -774,10 +1400,22 @@ void CarGame::buildTrackCollision() {
     trackBodies.clear();
 
     // 2. Создаем физику заново из актуальных данных track->walls
+    //    Важно: делаем 1 body на стену и добавляем к нему:
+    //      - прямоугольники сегментов
+    //      - "caps" (круги) в вершинах, чтобы углы у толстых стен были аккуратными.
     for (const auto& wall : track->walls) {
         if (wall.vertices.size() < 2) continue;
 
-        // Каждая стена в редакторе — это набор сегментов
+        b2BodyDef bd;
+        bd.type = b2_staticBody;
+        bd.position.Set(0.0f, 0.0f);
+        bd.angle = 0.0f;
+        b2Body* body = world->CreateBody(&bd);
+        trackBodies.push_back(body);
+
+        const float r = std::max(0.02f, wall.thickness * 0.5f);
+
+        // Сегменты как боксы (локально в body)
         for (size_t i = 0; i + 1 < wall.vertices.size(); ++i) {
             const glm::vec2 a = wall.vertices[i];
             const glm::vec2 b = wall.vertices[i + 1];
@@ -786,28 +1424,33 @@ void CarGame::buildTrackCollision() {
             float len = glm::length(diff);
             if (len < 0.001f) continue;
 
-            b2BodyDef bd;
-            bd.type = b2_staticBody;
-            // Ставим тело в центр сегмента
-            bd.position.Set(a.x + diff.x * 0.5f, a.y + diff.y * 0.5f);
-            bd.angle = std::atan2(diff.y, diff.x);
+            glm::vec2 mid = (a + b) * 0.5f;
+            float ang = std::atan2(diff.y, diff.x);
 
-            b2Body* body = world->CreateBody(&bd);
-
-            b2PolygonShape shape;
-            // Box2D принимает hx, hy (половину ширины и высоты)
-            shape.SetAsBox(len * 0.5f, wall.thickness * 0.5f);
+            b2PolygonShape seg;
+            seg.SetAsBox(len * 0.5f, r, b2Vec2(mid.x, mid.y), ang);
 
             b2FixtureDef fd;
-            fd.shape = &shape;
+            fd.shape = &seg;
             fd.friction = wall.friction;
             fd.restitution = wall.restitution;
             body->CreateFixture(&fd);
+        }
 
-            trackBodies.push_back(body);
+        // Капы (круги) в каждой вершине
+        for (const auto& v : wall.vertices) {
+            b2CircleShape cap;
+            cap.m_p.Set(v.x, v.y);
+            cap.m_radius = r;
+
+            b2FixtureDef fd;
+            fd.shape = &cap;
+            fd.friction = wall.friction;
+            fd.restitution = wall.restitution;
+            body->CreateFixture(&fd);
         }
     }
-    std::cout << "[Physics] Rebuilt! Segments: " << trackBodies.size() << std::endl;
+    std::cout << "[Physics] Rebuilt! Wall bodies: " << trackBodies.size() << std::endl;
 }
 
 void CarGame::createArenaBounds() {
@@ -872,34 +1515,44 @@ void CarGame::createWallBox(const glm::vec2& center, float hx, float hy, float a
 }
 
 void CarGame::updateCamera() {
-    // 1. Получаем реальные размеры окна
     int w, h;
     glfwGetFramebufferSize(window, &w, &h);
-
-    // Защита от деления на ноль (если свернули окно)
     if (h == 0) h = 1;
-
-    // 2. Считаем соотношение сторон
     float aspect = (float)w / (float)h;
 
-    // 3. Базовая высота в метрах Box2D (сколько метров видно по вертикали)
-    float viewHeightMeters = 20.0f; // Настрой под свой вкус (зум)
-    float viewWidthMeters = viewHeightMeters * aspect;
+    float viewH = spectatorMode ? 30.0f : 20.0f;
+    float viewW = viewH * aspect;
 
-    // 4. Сглаживание движения камеры (Lerp)
-    glm::vec2 p = car->getPosition();
-    float lerp = 0.1f;
-    cameraPos.x += (p.x - cameraPos.x) * lerp;
-    cameraPos.y += (p.y - cameraPos.y) * lerp;
+    if (spectatorMode) {
+        if (spectatorFree) {
+            // Свободная камера WASD
+            GLFWwindow* win = glfwGetCurrentContext();
+            if (win && !ImGui::GetIO().WantCaptureKeyboard) {
+                float spd = viewH * 0.022f;
+                if (glfwGetKey(win,GLFW_KEY_W)==GLFW_PRESS||glfwGetKey(win,GLFW_KEY_UP)==GLFW_PRESS)    cameraPos.y += spd;
+                if (glfwGetKey(win,GLFW_KEY_S)==GLFW_PRESS||glfwGetKey(win,GLFW_KEY_DOWN)==GLFW_PRESS)  cameraPos.y -= spd;
+                if (glfwGetKey(win,GLFW_KEY_A)==GLFW_PRESS||glfwGetKey(win,GLFW_KEY_LEFT)==GLFW_PRESS)  cameraPos.x -= spd;
+                if (glfwGetKey(win,GLFW_KEY_D)==GLFW_PRESS||glfwGetKey(win,GLFW_KEY_RIGHT)==GLFW_PRESS) cameraPos.x += spd;
+            }
+        } else {
+            // Плавно следим за spectatorTarget
+            int tgt = std::clamp(spectatorTarget, 0, (int)cars.size()-1);
+            if (!cars.empty()) {
+                glm::vec2 p = cars[tgt]->getPosition();
+                cameraPos.x += (p.x - cameraPos.x) * 0.07f;
+                cameraPos.y += (p.y - cameraPos.y) * 0.07f;
+            }
+        }
+    } else {
+        // Обычный — следим за активной машиной
+        if (!cars.empty() && activeCarIndex < (int)cars.size()) {
+            glm::vec2 p = cars[activeCarIndex]->getPosition();
+            cameraPos.x += (p.x - cameraPos.x) * 0.10f;
+            cameraPos.y += (p.y - cameraPos.y) * 0.10f;
+        }
+    }
 
-    // 5. Создаем проекцию
-    // Координаты: Лево, Право, Низ, Верх, Near, Far
-    const glm::mat4 proj = glm::ortho(
-        -viewWidthMeters / 2.0f, viewWidthMeters / 2.0f,
-        -viewHeightMeters / 2.0f, viewHeightMeters / 2.0f,
-        -1.0f, 1.0f
-    );
-
+    const glm::mat4 proj = glm::ortho(-viewW/2, viewW/2, -viewH/2, viewH/2, -1.0f, 1.0f);
     const glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(-cameraPos.x, -cameraPos.y, 0.0f));
     projection = proj * view;
 }
@@ -907,6 +1560,9 @@ void CarGame::updateCamera() {
 void CarGame::renderHud() {
     // For now, just print basic info to console since we don't have text rendering implemented yet
     // In a real implementation, this would use a text rendering library like FreeType with OpenGL
+    Car* car = activeCar();
+    if (!car) return;
+
     static float lastPrintTime = 0.0f;
     lastPrintTime += 1.0f/60.0f; // Assuming 60 FPS
 
@@ -939,7 +1595,11 @@ void CarGame::setEditorMode(bool enabled) {
         trackEditor->setMode(EditorMode::PLAY);
         createArenaBounds();
         buildTrackCollision();
-        if (car && track) car->reset(track->spawnPos, track->spawnYawRad);
+        if (track) {
+            if (Car* car = activeCar()) {
+                car->reset(track->spawnPos, track->spawnYawRad);
+            }
+        }
     }
 }
 
@@ -968,4 +1628,442 @@ std::string CarGame::formatLastTime(float seconds) {
         return "--:--.---";
     }
     return formatTime(seconds);
+}
+
+static bool segSegIntersect(const glm::vec2& a0, const glm::vec2& a1,
+                            const glm::vec2& b0, const glm::vec2& b1) {
+    auto cross = [](const glm::vec2& u, const glm::vec2& v) {
+        return u.x * v.y - u.y * v.x;
+    };
+    glm::vec2 r = a1 - a0;
+    glm::vec2 s = b1 - b0;
+    float rxs = cross(r, s);
+    float qpxr = cross(b0 - a0, r);
+
+    if (std::abs(rxs) < 1e-7f && std::abs(qpxr) < 1e-7f) {
+        // коллинеарны — считаем как "не пересекли" (для тайминга достаточно)
+        return false;
+    }
+    if (std::abs(rxs) < 1e-7f) {
+        // параллельны
+        return false;
+    }
+    float t = cross((b0 - a0), s) / rxs;
+    float u = cross((b0 - a0), r) / rxs;
+    return (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f);
+}
+
+void CarGame::updateLapTiming(float dt) {
+    if (!track || cars.empty()) return;
+
+    // старт/финиш должен быть задан
+    if (track->startFinish.start == track->startFinish.end) {
+        timing.hasStartFinish = false;
+        timing.hasPrevPos = false;
+        timing.lapTime = 0.0f;
+        return;
+    }
+    timing.hasStartFinish = true;
+
+    Car* car = cars[0].get();
+    if (!car) return;
+
+    glm::vec2 pos = car->getPosition();
+    timing.lapTime += dt;
+
+    // Определяем текущий сектор по полигонам (если есть)
+    int maxId = -1;
+    for (const auto& s : track->sectors) maxId = std::max(maxId, s.id);
+    int sectorCount = (maxId >= 0) ? (maxId + 1) : 0;
+    if (sectorCount > 0) {
+        if ((int)timing.currentSplits.size() != sectorCount) {
+            timing.currentSplits.assign(sectorCount, -1.0f);
+            timing.bestSplits.assign(sectorCount, -1.0f);
+            timing.lastSplits.assign(sectorCount, -1.0f);
+            timing.lastPassedSector = -1;
+            timing.currentSector = -1;
+        }
+
+        int sec = -1;
+        for (const auto& s : track->sectors) {
+            if ((int)s.polygon.size() >= 3 && pointInPolygon(pos, s.polygon)) {
+                sec = s.id;
+                break;
+            }
+        }
+        timing.currentSector = sec;
+
+        // фиксируем сплит при первом попадании в сектор по порядку
+        if (sec >= 0 && sec < sectorCount) {
+            if (sec == timing.lastPassedSector + 1 && timing.currentSplits[sec] < 0.0f) {
+                timing.currentSplits[sec] = timing.lapTime;
+                timing.lastPassedSector = sec;
+            }
+        }
+    }
+
+    // Пересечение линии старта/финиша
+    if (timing.hasPrevPos) {
+        const glm::vec2 a = track->startFinish.start;
+        const glm::vec2 b = track->startFinish.end;
+        if (segSegIntersect(timing.prevPos, pos, a, b)) {
+            // антидребезг: не засчитывать "сразу" после ресета
+            if (timing.lapTime > 1.0f) {
+                timing.lastLapTime = timing.lapTime;
+                if (timing.bestLapTime < 0.0f || timing.lastLapTime < timing.bestLapTime) {
+                    timing.bestLapTime = timing.lastLapTime;
+                    if (!timing.currentSplits.empty()) timing.bestSplits = timing.currentSplits;
+                }
+                if (!timing.currentSplits.empty()) timing.lastSplits = timing.currentSplits;
+
+                // старт нового круга
+                timing.lapTime = 0.0f;
+                if (!timing.currentSplits.empty())
+                    std::fill(timing.currentSplits.begin(), timing.currentSplits.end(), -1.0f);
+                timing.lastPassedSector = -1;
+            }
+        }
+    }
+
+    timing.prevPos = pos;
+    timing.hasPrevPos = true;
+}
+
+void CarGame::addAICar() {
+    if (!world) return;
+    int slotIdx = (int)cars.size();
+    glm::vec2 p; float yaw;
+    if (track) gridSlotPose(track->startGrid, slotIdx, p, yaw);
+    else { p = {slotIdx * 2.5f, 0.0f}; yaw = 0.0f; }
+
+    auto c = std::make_unique<Car>(world, p);
+    c->reset(p, yaw);
+    cars.push_back(std::move(c));
+    carIsAI.push_back(true);
+
+    static uint32_t aiSeed = 42;
+    aiControllers.push_back(std::make_unique<RandomController>(aiSeed++));
+    aiWaypointIndex.push_back(0);
+}
+
+void CarGame::removeLastAICar() {
+    for (int i = (int)cars.size()-1; i >= 0; --i) {
+        if (carIsAI[i]) {
+            cars.erase(cars.begin() + i);
+            carIsAI.erase(carIsAI.begin() + i);
+            aiControllers.erase(aiControllers.begin() + i);
+            if (i < (int)aiWaypointIndex.size())
+                aiWaypointIndex.erase(aiWaypointIndex.begin() + i);
+            activeCarIndex  = std::min(activeCarIndex,  (int)cars.size()-1);
+            spectatorTarget = std::min(spectatorTarget, (int)cars.size()-1);
+            return;
+        }
+    }
+}
+
+// ─── Pure Pursuit AI с rubber band ──────────────────────────────────────────
+//
+// Rubber band: сравниваем waypoint-прогресс AI с "лидером" (машина с макс wp).
+// Если AI сильно отстаёт → бонус к скорости; сильно впереди → небольшой штраф.
+// Диапазон коррекции: ±25% от базовой скорости.
+//
+// ── Catmull-Rom для AI (тот же алгоритм, что в редакторе) ────────────────────
+// ── Кубический Безье (синхронизирован с редактором, tension=0.33) ────────────
+static glm::vec2 bezierPtAI(const glm::vec2& p1, const glm::vec2& c1,
+                              const glm::vec2& c2, const glm::vec2& p2, float t) {
+    float u=1-t, u2=u*u, u3=u2*u, t2=t*t, t3=t2*t;
+    return u3*p1 + 3.0f*u2*t*c1 + 3.0f*u*t2*c2 + t3*p2;
+}
+
+void CarGame::rebuildSplineCache() {
+    const auto& ctrl = track->racingLine;
+    const int N = (int)ctrl.size();
+    splineCache.clear();
+    if (N < 2) { splineCacheVersion = N; return; }
+
+    // Если есть ручки из редактора — используем их.
+    // Иначе fallback на автоматические касательные.
+    std::vector<glm::vec2> cp1(N), cp2(N);
+    if ((int)track->racingLineOutHandle.size() == N) {
+        for (int i = 0; i < N; ++i) {
+            cp1[i] = ctrl[i] + track->racingLineOutHandle[i];
+            cp2[i] = ctrl[i] - track->racingLineOutHandle[i];
+        }
+    } else {
+        const float tension = 0.33f;
+        for (int i = 0; i < N; ++i) {
+            glm::vec2 tang = (ctrl[(i+1)%N] - ctrl[(i-1+N)%N]) * tension;
+            cp1[i] = ctrl[i] + tang;
+            cp2[i] = ctrl[i] - tang;
+        }
+    }
+    splineCache.reserve(N * SPLINE_SAMPLES);
+    for (int i = 0; i < N; ++i) {
+        int j = (i+1)%N;
+        for (int s = 0; s < SPLINE_SAMPLES; ++s)
+            splineCache.push_back(bezierPtAI(ctrl[i], cp1[i], cp2[j], ctrl[j],
+                                              (float)s / SPLINE_SAMPLES));
+    }
+    splineCacheVersion = N;
+    for (int& wp : aiWaypointIndex) wp = 0;
+}
+
+VehicleControls CarGame::computeRacingLineControls(int ci) {
+    // Перестраиваем кэш если racingLine изменилась (редактор)
+    if (!track) return {};
+    int ctrlN = (int)track->racingLine.size();
+    if (ctrlN < 2) return {};
+    if (splineCacheVersion != ctrlN) rebuildSplineCache();
+
+    // Используем сплайн если есть, иначе сырые точки
+    const std::vector<glm::vec2>& line = splineCache.size() >= 2 ? splineCache : track->racingLine;
+    const int N = (int)line.size();
+    if (N < 2) return {};
+
+    glm::vec2 carPos = cars[ci]->getPosition();
+    float     carYaw = cars[ci]->getAngleRad();
+    float     carSpd = cars[ci]->getSpeed();
+
+    // ── 1. Advance nearest waypoint (окно 80 точек вперёд) ───────────────────
+    if (ci >= (int)aiWaypointIndex.size()) aiWaypointIndex.resize(ci+1, 0);
+    int& wp = aiWaypointIndex[ci];
+    {
+        float bestD2 = 1e9f;
+        const int window = std::min(N, 80);
+        for (int di = 0; di < window; ++di) {
+            int idx = (wp + di) % N;
+            glm::vec2 d = line[idx] - carPos;
+            float d2 = d.x*d.x + d.y*d.y;
+            if (d2 < bestD2) { bestD2 = d2; wp = idx; }
+            else if (di > 5 && d2 > bestD2 * 4.0f) break;
+        }
+    }
+
+    // ── 2. Rubber Band ────────────────────────────────────────────────────────
+    float rubberFactor = 1.0f;
+    {
+        int leaderWp = wp;
+        for (int k = 0; k < (int)cars.size(); ++k) {
+            if (k == ci) continue;
+            int kwp = (k < (int)aiWaypointIndex.size()) ? aiWaypointIndex[k] : 0;
+            int diff = (kwp - leaderWp + N) % N;
+            if (diff < N/2 && kwp != leaderWp) leaderWp = kwp;
+        }
+        int gap = (leaderWp - wp + N) % N;
+        if (gap > N/2) gap = 0;
+        rubberFactor = 1.0f + std::clamp((float)gap/(float)N * 2.0f, -0.15f, 0.30f);
+    }
+
+    // ── 3. Pure Pursuit lookahead ─────────────────────────────────────────────
+    float lookahead = 4.5f + std::abs(carSpd) * 0.28f;
+    lookahead = std::clamp(lookahead, 3.5f, 20.0f);
+
+    glm::vec2 target = line[(wp+1)%N];
+    {
+        float accum = 0.0f;
+        for (int di = 1; di < N; ++di) {
+            int a=(wp+di-1)%N, b=(wp+di)%N;
+            accum += glm::length(line[b]-line[a]);
+            target = line[b];
+            if (accum >= lookahead) break;
+        }
+    }
+
+    // ── 4. Steering ───────────────────────────────────────────────────────────
+    glm::vec2 toTgt  = target - carPos;
+    float desiredYaw = std::atan2(toTgt.y, toTgt.x);
+    float yawErr     = desiredYaw - carYaw;
+    while (yawErr >  (float)M_PI) yawErr -= 2.0f*(float)M_PI;
+    while (yawErr < -(float)M_PI) yawErr += 2.0f*(float)M_PI;
+
+    float steerGain = 1.5f + std::max(0.0f, 8.0f - std::abs(carSpd)) * 0.07f;
+    float steer = std::clamp(yawErr * steerGain, -1.0f, 1.0f);
+
+    // ── 5. Curvature scan + тормозная точка (фикс шпилек) ──────────────────────
+    // Сканируем SCAN_DIST метров вперёд: находим максимальную кривизну и на каком
+    // расстоянии она встречается. Затем по формуле тормозного пути вычисляем
+    // максимально допустимую скорость прямо сейчас: v² ≤ v_corner² + 2·a·d
+    const float MAX_SPEED  = 22.0f;
+    const float MIN_SPEED  =  4.5f;
+    const float DECEL_RATE =  9.0f;   // м/с² — эффективное замедление
+    const float SCAN_DIST  = 40.0f;   // метров вперёд
+
+    float maxCurv  = 0.0f;
+    float curvDist = SCAN_DIST;
+    {
+        float accum = 0.0f;
+        for (int di = 1; di < N; ++di) {
+            int a=(wp+di-1)%N, b=(wp+di)%N, cc=(wp+di+1)%N;
+            float seg = glm::length(line[b]-line[a]);
+            accum += seg;
+            if (accum > SCAN_DIST) break;
+            glm::vec2 d1=line[b]-line[a], d2=line[cc]-line[b];
+            float l1=glm::length(d1), l2=glm::length(d2);
+            if (l1<1e-4f||l2<1e-4f) continue;
+            float cross = std::abs((d1.x/l1)*(d2.y/l2)-(d1.y/l1)*(d2.x/l2));
+            if (cross > maxCurv) { maxCurv = cross; curvDist = accum; }
+        }
+    }
+
+    // Целевая скорость в самом повороте
+    float cornerSpd     = std::clamp(MAX_SPEED - maxCurv * 55.0f, MIN_SPEED, MAX_SPEED);
+    // Максимум сейчас чтобы успеть затормозить (v² = vc² + 2ad)
+    float brakeLimitSpd = std::sqrt(cornerSpd*cornerSpd + 2.0f*DECEL_RATE*curvDist);
+    float baseSpd       = std::clamp(std::min(cornerSpd, brakeLimitSpd) * rubberFactor,
+                                     MIN_SPEED, MAX_SPEED * 1.3f);
+
+    // Перед крутым поворотом уменьшаем lookahead для точного попадания в апекс
+    if (maxCurv > 0.25f) {
+        float tightLA = std::max(3.0f, lookahead * (1.0f - maxCurv * 1.2f));
+        glm::vec2 tightTgt = line[(wp+1)%N];
+        float acc2 = 0.0f;
+        for (int di = 1; di < N; ++di) {
+            int a=(wp+di-1)%N, b=(wp+di)%N;
+            acc2 += glm::length(line[b]-line[a]);
+            tightTgt = line[b];
+            if (acc2 >= tightLA) break;
+        }
+        float blend = std::clamp((maxCurv - 0.25f) * 4.0f, 0.0f, 1.0f);
+        target = (1.0f - blend)*target + blend*tightTgt;
+        // Пересчитываем steer
+        glm::vec2 toT2 = target - carPos;
+        float dy2 = std::atan2(toT2.y, toT2.x);
+        float ye2 = dy2 - carYaw;
+        while (ye2 >  (float)M_PI) ye2 -= 2*(float)M_PI;
+        while (ye2 < -(float)M_PI) ye2 += 2*(float)M_PI;
+        steer = std::clamp(ye2 * steerGain, -1.0f, 1.0f);
+    }
+
+    // ── 6. Продольный PD ──────────────────────────────────────────────────────
+    float spdErr = baseSpd - std::abs(carSpd);
+    float throttle = 0.0f, brake = 0.0f;
+
+    if (carSpd < -0.5f) {
+        throttle = 0.9f;
+    } else if (spdErr > 0.3f) {
+        throttle = std::clamp(spdErr / 3.5f, 0.15f, 1.0f);
+    } else if (spdErr < -1.0f) {
+        float bf = std::clamp(-spdErr / 4.5f, 0.15f, 1.0f);
+        if (maxCurv > 0.3f) bf = std::min(1.0f, bf * 1.4f); // усиленное торможение в шпилях
+        brake = bf;
+    } else {
+        throttle = 0.2f;
+    }
+
+    VehicleControls ctrl;
+    ctrl.throttle  = throttle;
+    ctrl.brake     = brake;
+    ctrl.steer     = steer;
+    ctrl.handbrake = false;
+    return ctrl;
+}
+
+// ─── Система границ трассы ────────────────────────────────────────────────────
+
+// Point-in-polygon (Ray casting)
+bool CarGame::pointInPolygon(const glm::vec2& pt, const std::vector<glm::vec2>& poly) {
+    if (poly.size() < 3) return false;
+    bool inside = false;
+    int n = (int)poly.size();
+    for (int i = 0, j = n-1; i < n; j = i++) {
+        const glm::vec2& a = poly[i];
+        const glm::vec2& b = poly[j];
+        if (((a.y > pt.y) != (b.y > pt.y)) &&
+            (pt.x < (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x))
+            inside = !inside;
+    }
+    return inside;
+}
+
+// Дистанция от точки до ближайшего сегмента
+float CarGame::distToPolyline(const glm::vec2& pt, const std::vector<glm::vec2>& poly, bool closed) {
+    float minD = 1e9f;
+    int n = (int)poly.size();
+    int segs = closed ? n : n-1;
+    for (int i = 0; i < segs; ++i) {
+        const glm::vec2& a = poly[i];
+        const glm::vec2& b = poly[(i+1)%n];
+        glm::vec2 ab = b-a, ap = pt-a;
+        float t = std::clamp(glm::dot(ap,ab)/std::max(1e-6f,glm::dot(ab,ab)), 0.0f, 1.0f);
+        float d = glm::length(ap - ab*t);
+        minD = std::min(minD, d);
+    }
+    return minD;
+}
+
+void CarGame::updateOffTrack(float dt) {
+    if (!track) return;
+    bool hasOuter = track->outerBoundary.size() >= 3;
+    bool hasInner = track->innerBoundary.size() >= 3;
+    if (!hasOuter && !hasInner) return;
+
+    // Убедиться что вектор штрафов нужного размера
+    if ((int)carPenalties.size() != (int)cars.size())
+        carPenalties.resize(cars.size());
+
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        glm::vec2 pos = cars[i]->getPosition();
+        bool offTrack = false;
+
+        // Вне внешней границы?
+        if (hasOuter && !pointInPolygon(pos, track->outerBoundary))
+            offTrack = true;
+        // Внутри внутренней границы (газон)?
+        if (hasInner && pointInPolygon(pos, track->innerBoundary))
+            offTrack = true;
+
+        auto& pen = carPenalties[i];
+        pen.isOffTrack = offTrack;
+
+        if (offTrack) {
+            pen.offTrackTime += dt;
+            // Замедление нарастает до 40% от скорости за 1 секунду вне трассы
+            pen.slowdownFactor = std::max(0.35f, 1.0f - pen.offTrackTime * 0.65f);
+            // Штраф +1 сек каждые 2 секунды вне трассы
+            if (pen.offTrackTime >= 2.0f) {
+                pen.penaltySeconds += 1.0f;
+                pen.offTrackTime   -= 2.0f;
+            }
+            applyOffTrackPenalty(i, dt);
+        } else {
+            pen.offTrackTime   = std::max(0.0f, pen.offTrackTime - dt * 2.0f); // быстро восстанавливаем
+            pen.slowdownFactor = std::min(1.0f, pen.slowdownFactor + dt * 2.0f);
+        }
+    }
+}
+
+void CarGame::applyOffTrackPenalty(int ci, float /*dt*/) {
+    if (ci >= (int)carPenalties.size()) return;
+    float factor = carPenalties[ci].slowdownFactor;
+    if (factor >= 1.0f || !cars[ci]) return;
+
+    // Гасим скорость через setControls: добавляем принудительный тормоз
+    // (работает для любых машин без доступа к Box2D body напрямую)
+    float spd = std::abs(cars[ci]->getSpeed());
+    if (spd > 2.0f) {
+        float brakeForce = (1.0f - factor) * 0.8f;  // 0..0.8 в зависимости от нарушения
+        // Читаем текущие контролы и усиливаем тормоз
+        VehicleControls cur;
+        cur.throttle  = 0.0f;
+        cur.brake     = std::clamp(brakeForce, 0.0f, 0.9f);
+        cur.steer     = 0.0f;   // не меняем руль
+        cur.handbrake = false;
+        // Применяем только если машина едет — не блокируем стоячую
+        cars[ci]->setControls(cur.throttle, cur.brake, 0.0f, false);
+    }
+}
+
+
+void CarGame::resetAllCarsToGrid() {
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        glm::vec2 p; float yaw;
+        if (track) {
+            gridSlotPose(track->startGrid, i, p, yaw);
+        } else {
+            p = glm::vec2(i * 2.5f, 0.0f);
+            yaw = 0.0f;
+        }
+        cars[i]->reset(p, yaw);
+    }
+    if (telemetry) telemetry->reset();
 }

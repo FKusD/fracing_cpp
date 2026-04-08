@@ -66,8 +66,8 @@ void Car::fixedUpdate(float dt) {
     b2Vec2 right(-sin_yaw, cos_yaw);
 
     // Раскладываем скорость на продольную/поперечную
-    float vLong = b2Dot(v, fwd);
-    float vLat  = b2Dot(v, right);
+    vLong = b2Dot(v, fwd);
+    vLat  = b2Dot(v, right);
 
     // 1) Продольную скорость задаём из модели (state.v = целевая/рассчитанная продольная)
     float targetLong = state.v;

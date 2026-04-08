@@ -42,7 +42,9 @@ void Telemetry::update(float dt, const glm::vec2& position, float speed, float s
     latest.vLat = vLat;
 
     trajectory.push_back(position);
+    speeds.push_back(std::abs(speed));
     if (trajectory.size() > maxTrajectoryPoints) trajectory.erase(trajectory.begin());
+    if (speeds.size() > maxTrajectoryPoints)    speeds.erase(speeds.begin());
 }
 
 
@@ -62,5 +64,6 @@ void Telemetry::reset() {
     totalDistance = 0.0f;
 
     trajectory.clear();
+    speeds.clear();
     latest = Sample{};
 }

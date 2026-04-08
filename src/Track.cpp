@@ -17,6 +17,13 @@ void Track::toJson(nlohmann::json& j) const {
     j["spawnPos"] = spawnPos;
     j["spawnYawRad"] = spawnYawRad;
     j["arenaHalfExtents"] = arenaHalfExtents;
+    j["startGrid"] = startGrid;
+    j["pitGrid"] = pitGrid;
+    j["racingLine"]          = racingLine;
+    j["racingLineOutHandle"]  = racingLineOutHandle;
+    j["outerBoundary"]        = outerBoundary;
+    j["innerBoundary"]        = innerBoundary;
+    j["startFinish"]          = nlohmann::json{{"start", startFinish.start}, {"end", startFinish.end}};
 }
 
 void Track::fromJson(const nlohmann::json& j) {
@@ -28,6 +35,25 @@ void Track::fromJson(const nlohmann::json& j) {
     spawnPos = j["spawnPos"];
     spawnYawRad = j["spawnYawRad"];
     arenaHalfExtents = j.value("arenaHalfExtents", glm::vec2(60.0f, 60.0f));
+    startGrid = j.value("startGrid", StartGrid{});
+    pitGrid   = j.value("pitGrid", StartGrid{});
+    racingLine          = j.value("racingLine",          std::vector<glm::vec2>{});
+    racingLineOutHandle = j.value("racingLineOutHandle", std::vector<glm::vec2>{});
+    outerBoundary       = j.value("outerBoundary",       std::vector<glm::vec2>{});
+    innerBoundary       = j.value("innerBoundary",       std::vector<glm::vec2>{});
+    if (j.contains("startFinish")) {
+        startFinish.start = j["startFinish"].value("start", glm::vec2{0,0});
+        startFinish.end   = j["startFinish"].value("end",   glm::vec2{0,0});
+    } else {
+        startFinish = Checkpoint{};
+    }
+
+    // backward-compatible: если старый трек только со spawnPos/spawnYawRad,
+    // то используем их как origin/yaw для startGrid, если origin “нулевой”
+    if (startGrid.origin == glm::vec2(0.0f) && (spawnPos != glm::vec2(0.0f))) {
+        startGrid.origin = spawnPos;
+        startGrid.yawRad = spawnYawRad;
+    }
 }
 
 static std::string readAllTextFile(const std::string& path) {

@@ -72,6 +72,11 @@ add_executable(fracing_cpp
         include/WorldRenderer.h
         include/DebugRenderer.h
         src/DebugRenderer.cpp
+        include/Controller.h
+        include/RandomController.h
+        src/RandomController.cpp
+        src/ObservationDatasetLogger.cpp
+        src/BehavioralCloningController.cpp
 )
 
 add_library(glad STATIC

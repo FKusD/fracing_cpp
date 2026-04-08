@@ -42,6 +42,17 @@ struct SurfaceArea {
     float mu = 1.15f;                 // Grip coefficient
 };
 
+struct StartGrid {
+    glm::vec2 origin = glm::vec2(0.0f); // центр первого слота (P1)
+    float yawRad = 0.0f;                // направление “вперёд” по сетке
+    int rows = 2;                       // сколько рядов (в глубину)
+    int cols = 4;                       // сколько колонок (в ширину)
+    float rowSpacing = 6.0f;            // расстояние между рядами (в метрах)
+    float colSpacing = 3.0f;            // расстояние между колонками
+    bool serpentine = true;             // “шахматка” (второй ряд со сдвигом)
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StartGrid, origin, yawRad, rows, cols, rowSpacing, colSpacing, serpentine);
+
 struct Track {
     std::string name;
     std::vector<WallSegment> walls;
@@ -50,6 +61,17 @@ struct Track {
     std::vector<SurfaceArea> surfaces;
     glm::vec2 spawnPos = glm::vec2(0.0f, 0.0f);
     glm::vec2 arenaHalfExtents = glm::vec2(60.0f, 60.0f);
+    StartGrid startGrid;
+    StartGrid pitGrid; // опционально: места в питлейне/боксы
+    std::vector<glm::vec2> racingLine;          // AI ideal trajectory
+    std::vector<glm::vec2> racingLineOutHandle; // Bezier out-handles (1:1 с racingLine)
+
+    // ── Границы трассы ─────────────────────────────────────────────────────────
+    std::vector<glm::vec2> outerBoundary;  // внешняя граница (полигон)
+    std::vector<glm::vec2> innerBoundary;  // внутренняя граница / газон
+
+    // ── Старт / Финиш ──────────────────────────────────────────────────────────
+    Checkpoint startFinish;  // линия старта/финиша для отсчёта кругов
 
     float spawnYawRad = 0.0f;
 
