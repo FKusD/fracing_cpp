@@ -35,6 +35,10 @@ public:
 
     const VehicleParams& getParams() const { return params; }
 
+    b2Body* getBody() { return body; }
+    const b2Body* getBody() const { return body; }
+    void setCarCollisionEnabled(bool enabled);
+
 private:
     b2World* world;
     b2Body* body;

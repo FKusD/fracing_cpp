@@ -22,10 +22,13 @@
 #include <cstring>
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <glm/gtc/constants.hpp>
 #include "DebugRenderer.h"
 #include "RandomController.h"
 #include "ObservationDatasetLogger.h"
 #include "BehavioralCloningController.h"
+#include "GenomeController.h"
+#include <random>
 
 namespace {
 GLuint compileShader(GLenum type, const char* src) {
@@ -92,6 +95,34 @@ static float raySegmentHit(const glm::vec2& ro, const glm::vec2& rd,
     const float u = cross2(delta, rd) / den;
     if (t >= 0.0f && u >= 0.0f && u <= 1.0f) return t;
     return -1.0f;
+}
+static int tournamentPick(const std::vector<int>& ranked, std::mt19937& rng, int tournamentSize = 3) {
+    if (ranked.empty()) return -1;
+    std::uniform_int_distribution<int> uid(0, (int)ranked.size() - 1);
+    int best = ranked[uid(rng)];
+    for (int i = 1; i < tournamentSize; ++i) {
+        int cand = ranked[uid(rng)];
+        if (cand < best) best = cand; // ranked already sorted by fitness desc, smaller index = better rank
+    }
+    return best;
+}
+
+    static GenomeSpec crossoverGenome(const GenomeSpec& a, const GenomeSpec& b, std::mt19937& rng) {
+    GenomeSpec c = a;
+    if (a.genes.size() != b.genes.size()) return c;
+    std::bernoulli_distribution coin(0.5);
+    for (size_t i = 0; i < c.genes.size(); ++i) {
+        c.genes[i] = coin(rng) ? a.genes[i] : b.genes[i];
+    }
+    return c;
+}
+
+    static void mutateGenome(GenomeSpec& g, std::mt19937& rng, float prob, float sigma) {
+    std::bernoulli_distribution flip(prob);
+    std::normal_distribution<float> nd(0.0f, sigma);
+    for (float& w : g.genes) {
+        if (flip(rng)) w += nd(rng);
+    }
 }
 struct SimpleRenderer {
     GLuint vao = 0;
@@ -502,7 +533,10 @@ bool CarGame::initialize() {
         carIsAI.push_back(false);
         aiControllers.push_back(nullptr);
         aiWaypointIndex.push_back(0);
+        aiConfigs_.push_back(CarAIConfig{});
     }
+    trainingFitness_.assign(cars.size(), 0.0f);
+    rebuildCarCollisionMasks();
 
     // Create telemetry system
     telemetry = std::make_unique<Telemetry>();
@@ -545,6 +579,7 @@ void CarGame::update(float deltaTime) {
                 cars[i]->reset(p, yaw);
             }
             if (telemetry) telemetry->reset();
+            rebuildCarCollisionMasks();
         }
     }
     wasEditing = nowEditing;
@@ -562,8 +597,9 @@ void CarGame::update(float deltaTime) {
 
     // fixed-step симуляция (стоп на паузе)
     if (isPaused) { updateCamera(); return; }
-    accumulator += deltaTime;
-    while (accumulator >= STEP) {
+    accumulator += deltaTime * simSpeedMultiplier_;
+    int substeps = 0;
+    while (accumulator >= STEP && substeps < maxSubstepsPerFrame_) {
         handleInput();
 
         // 1) обновляем mu под каждой машиной
@@ -585,155 +621,191 @@ void CarGame::update(float deltaTime) {
         if ((int)gSensorDebug.observations.size() != (int)cars.size())
             gSensorDebug.observations.resize(cars.size());
 
-        auto buildObservation = [&](int ci) -> Observation {
-            Observation obs;
-            if (ci < 0 || ci >= (int)cars.size() || !cars[ci]) return obs;
-
-            Car* c = cars[ci].get();
-            obs.pos          = c->getPosition();
-            obs.speed        = c->getSpeed();
-            obs.speedForward = c->getSpeed();
-            obs.speedAbs     = std::abs(c->getSpeed());
-            obs.yaw          = c->getAngleRad();
-            obs.steer        = c->getSteer();
-            obs.surfaceMu    = c->getSurfaceMu();
-
-            const glm::vec2 forward(std::cos(obs.yaw), std::sin(obs.yaw));
-            const glm::vec2 right(-std::sin(obs.yaw), std::cos(obs.yaw));
-
-            constexpr float kHalfLen = 0.40f;
-            constexpr float kHalfWid = 0.20f;
-            const std::array<glm::vec2, Observation::kCornerCount> corners = {{
-                obs.pos + forward * kHalfLen - right * kHalfWid,
-                obs.pos + forward * kHalfLen + right * kHalfWid,
-                obs.pos - forward * kHalfLen - right * kHalfWid,
-                obs.pos - forward * kHalfLen + right * kHalfWid
-            }};
-            const std::array<float, Observation::kRaysPerCorner> rayAngles = {{
-                -1.5707963f, -1.0471976f, -0.5235988f, -0.1745329f,
-                 0.1745329f,  0.5235988f,  1.0471976f,  1.5707963f
-            }};
-            const float maxRayLen = 18.0f;
-
-            auto testSeg = [&](const glm::vec2& ro, const glm::vec2& rd, float curBest,
-                               const glm::vec2& a, const glm::vec2& b) {
-                float t = raySegmentHit(ro, rd, a, b);
-                return (t >= 0.0f && t < curBest) ? t : curBest;
-            };
-
-            int rayIdx = 0;
-            for (int cornerIdx = 0; cornerIdx < Observation::kCornerCount; ++cornerIdx) {
-                const glm::vec2 ro = corners[cornerIdx];
-                for (float ang : rayAngles) {
-                    glm::vec2 rd = rotateLocal(forward, right, ang);
-                    float best = maxRayLen;
-
-                    if (track) {
-                        const auto testPolyline = [&](const std::vector<glm::vec2>& poly, bool closed) {
-                            if (poly.size() < 2) return;
-                            const int n = (int)poly.size();
-                            const int segs = closed ? n : (n - 1);
-                            for (int i = 0; i < segs; ++i) {
-                                best = testSeg(ro, rd, best, poly[i], poly[(i + 1) % n]);
-                            }
-                        };
-
-                        testPolyline(track->outerBoundary, true);
-                        testPolyline(track->innerBoundary, true);
-
-                        for (const auto& wall : track->walls) {
-                            const int wn = (int)wall.vertices.size();
-                            if (wn < 2) continue;
-                            for (int i = 0; i < wn - 1; ++i) {
-                                const glm::vec2 a = wall.vertices[i];
-                                const glm::vec2 b = wall.vertices[i + 1];
-                                glm::vec2 seg = b - a;
-                                float len = glm::length(seg);
-                                if (len < 1e-4f) continue;
-                                glm::vec2 tang = seg / len;
-                                glm::vec2 norm(-tang.y, tang.x);
-                                glm::vec2 off = norm * (0.5f * wall.thickness);
-                                const glm::vec2 p0 = a + off;
-                                const glm::vec2 p1 = b + off;
-                                const glm::vec2 p2 = b - off;
-                                const glm::vec2 p3 = a - off;
-                                best = testSeg(ro, rd, best, p0, p1);
-                                best = testSeg(ro, rd, best, p1, p2);
-                                best = testSeg(ro, rd, best, p2, p3);
-                                best = testSeg(ro, rd, best, p3, p0);
-                            }
-                        }
-                    }
-
-                    obs.rayDistance[rayIdx] = std::clamp(best / maxRayLen, 0.0f, 1.0f);
-                    obs.rayStart[rayIdx] = ro;
-                    obs.rayEnd[rayIdx] = ro + rd * best;
-                    ++rayIdx;
-                }
-            }
-
-            if (track && track->racingLine.size() >= 2) {
-                const int ctrlN = (int)track->racingLine.size();
-                if (splineCacheVersion != ctrlN) rebuildSplineCache();
-                const std::vector<glm::vec2>& line = splineCache.size() >= 2 ? splineCache : track->racingLine;
-                const int N = (int)line.size();
-                if (N >= 2) {
-                    int nearest = (ci < (int)aiWaypointIndex.size()) ? aiWaypointIndex[ci] : 0;
-                    nearest = std::clamp(nearest, 0, N - 1);
-                    float bestD2 = 1e30f;
-                    const int window = std::min(N, 160);
-                    for (int di = 0; di < window; ++di) {
-                        int idx = (nearest + di) % N;
-                        glm::vec2 d = line[idx] - obs.pos;
-                        float d2 = glm::dot(d, d);
-                        if (d2 < bestD2) {
-                            bestD2 = d2;
-                            nearest = idx;
-                        } else if (di > 8 && d2 > bestD2 * 6.0f) {
-                            break;
-                        }
-                    }
-                    obs.progress = (float)nearest / (float)std::max(1, N);
-                    obs.distToCenterline = std::sqrt(std::max(0.0f, bestD2));
-
-                    const std::array<float, 3> previewDist = {{
-                        std::clamp(4.0f  + obs.speedAbs * 0.18f, 3.0f, 10.0f),
-                        std::clamp(8.0f  + obs.speedAbs * 0.25f, 6.0f, 18.0f),
-                        std::clamp(14.0f + obs.speedAbs * 0.33f, 10.0f, 28.0f)
-                    }};
-
-                    for (int pi = 0; pi < 3; ++pi) {
-                        glm::vec2 target = line[(nearest + 1) % N];
-                        float accum = 0.0f;
-                        for (int di = 1; di < N; ++di) {
-                            int a = (nearest + di - 1) % N;
-                            int b = (nearest + di) % N;
-                            accum += glm::length(line[b] - line[a]);
-                            target = line[b];
-                            if (accum >= previewDist[pi]) break;
-                        }
-                        glm::vec2 rel = target - obs.pos;
-                        float x = glm::dot(rel, forward);
-                        float y = glm::dot(rel, right);
-                        obs.headingError[pi] = std::atan2(y, std::max(0.1f, x));
-                        float denom = x * x + y * y;
-                        obs.curvature[pi] = (denom > 1e-4f) ? (2.0f * y / denom) : 0.0f;
-                    }
-                }
-            }
-
-            if (track) {
-                bool hasOuter = track->outerBoundary.size() >= 3;
-                bool hasInner = track->innerBoundary.size() >= 3;
-                obs.offTrack = (hasOuter && !pointInPolygon(obs.pos, track->outerBoundary)) ||
-                               (hasInner &&  pointInPolygon(obs.pos, track->innerBoundary));
-            }
-            return obs;
-        };
+        /* // auto buildObservation = [&](int ci) -> Observation {
+        //     Observation obs;
+        //     if (ci < 0 || ci >= (int)cars.size() || !cars[ci]) return obs;
+        //
+        //     Car* c = cars[ci].get();
+        //     obs.pos          = c->getPosition();
+        //     obs.speed        = c->getSpeed();
+        //     obs.speedForward = c->getSpeed();
+        //     obs.speedAbs     = std::abs(c->getSpeed());
+        //     obs.yaw          = c->getAngleRad();
+        //     obs.steer        = c->getSteer();
+        //     obs.surfaceMu    = c->getSurfaceMu();
+        //
+        //     const glm::vec2 forward(std::cos(obs.yaw), std::sin(obs.yaw));
+        //     const glm::vec2 right(-std::sin(obs.yaw), std::cos(obs.yaw));
+        //
+        //     constexpr float kHalfLen = 0.40f;
+        //     constexpr float kHalfWid = 0.20f;
+        //     const std::array<glm::vec2, Observation::kCornerCount> corners = {{
+        //         obs.pos + forward * kHalfLen - right * kHalfWid,
+        //         obs.pos + forward * kHalfLen + right * kHalfWid,
+        //         obs.pos - forward * kHalfLen - right * kHalfWid,
+        //         obs.pos - forward * kHalfLen + right * kHalfWid
+        //     }};
+        //     const std::array<float, Observation::kRaysPerCorner> rayAngles = {{
+        //         -1.5707963f, -1.0471976f, -0.5235988f, -0.1745329f,
+        //          0.1745329f,  0.5235988f,  1.0471976f,  1.5707963f
+        //     }};
+        //     const float maxRayLen = 18.0f;
+        //
+        //     auto testSeg = [&](const glm::vec2& ro, const glm::vec2& rd, float curBest,
+        //                        const glm::vec2& a, const glm::vec2& b) {
+        //         float t = raySegmentHit(ro, rd, a, b);
+        //         return (t >= 0.0f && t < curBest) ? t : curBest;
+        //     };
+        //
+        //     int rayIdx = 0;
+        //     for (int cornerIdx = 0; cornerIdx < Observation::kCornerCount; ++cornerIdx) {
+        //         const glm::vec2 ro = corners[cornerIdx];
+        //         for (float ang : rayAngles) {
+        //             glm::vec2 rd = rotateLocal(forward, right, ang);
+        //             float best = maxRayLen;
+        //
+        //             if (track) {
+        //                 const auto testPolyline = [&](const std::vector<glm::vec2>& poly, bool closed) {
+        //                     if (poly.size() < 2) return;
+        //                     const int n = (int)poly.size();
+        //                     const int segs = closed ? n : (n - 1);
+        //                     for (int i = 0; i < segs; ++i) {
+        //                         best = testSeg(ro, rd, best, poly[i], poly[(i + 1) % n]);
+        //                     }
+        //                 };
+        //
+        //                 testPolyline(track->outerBoundary, true);
+        //                 testPolyline(track->innerBoundary, true);
+        //
+        //                 for (const auto& wall : track->walls) {
+        //                     const int wn = (int)wall.vertices.size();
+        //                     if (wn < 2) continue;
+        //                     for (int i = 0; i < wn - 1; ++i) {
+        //                         const glm::vec2 a = wall.vertices[i];
+        //                         const glm::vec2 b = wall.vertices[i + 1];
+        //                         glm::vec2 seg = b - a;
+        //                         float len = glm::length(seg);
+        //                         if (len < 1e-4f) continue;
+        //                         glm::vec2 tang = seg / len;
+        //                         glm::vec2 norm(-tang.y, tang.x);
+        //                         glm::vec2 off = norm * (0.5f * wall.thickness);
+        //                         const glm::vec2 p0 = a + off;
+        //                         const glm::vec2 p1 = b + off;
+        //                         const glm::vec2 p2 = b - off;
+        //                         const glm::vec2 p3 = a - off;
+        //                         best = testSeg(ro, rd, best, p0, p1);
+        //                         best = testSeg(ro, rd, best, p1, p2);
+        //                         best = testSeg(ro, rd, best, p2, p3);
+        //                         best = testSeg(ro, rd, best, p3, p0);
+        //                     }
+        //                 }
+        //             }
+        //
+        //             obs.rayDistance[rayIdx] = std::clamp(best / maxRayLen, 0.0f, 1.0f);
+        //             obs.rayStart[rayIdx] = ro;
+        //             obs.rayEnd[rayIdx] = ro + rd * best;
+        //             ++rayIdx;
+        //         }
+        //     }
+        //
+        //     if (track && track->racingLine.size() >= 2) {
+        //         const int ctrlN = (int)track->racingLine.size();
+        //         if (splineCacheVersion != ctrlN) rebuildSplineCache();
+        //         const std::vector<glm::vec2>& line = splineCache.size() >= 2 ? splineCache : track->racingLine;
+        //         const int N = (int)line.size();
+        //         if (N >= 2) {
+        //             int nearest = (ci < (int)aiWaypointIndex.size()) ? aiWaypointIndex[ci] : 0;
+        //             nearest = std::clamp(nearest, 0, N - 1);
+        //             float bestD2 = 1e30f;
+        //             const int window = std::min(N, 160);
+        //             for (int di = 0; di < window; ++di) {
+        //                 int idx = (nearest + di) % N;
+        //                 glm::vec2 d = line[idx] - obs.pos;
+        //                 float d2 = glm::dot(d, d);
+        //                 if (d2 < bestD2) {
+        //                     bestD2 = d2;
+        //                     nearest = idx;
+        //                 } else if (di > 8 && d2 > bestD2 * 6.0f) {
+        //                     break;
+        //                 }
+        //             }
+        //             obs.progress = (float)nearest / (float)std::max(1, N);
+        //             obs.distToCenterline = std::sqrt(std::max(0.0f, bestD2));
+        //
+        //             const std::array<float, 3> previewDist = {{
+        //                 std::clamp(4.0f  + obs.speedAbs * 0.18f, 3.0f, 10.0f),
+        //                 std::clamp(8.0f  + obs.speedAbs * 0.25f, 6.0f, 18.0f),
+        //                 std::clamp(14.0f + obs.speedAbs * 0.33f, 10.0f, 28.0f)
+        //             }};
+        //
+        //             for (int pi = 0; pi < 3; ++pi) {
+        //                 glm::vec2 target = line[(nearest + 1) % N];
+        //                 float accum = 0.0f;
+        //                 for (int di = 1; di < N; ++di) {
+        //                     int a = (nearest + di - 1) % N;
+        //                     int b = (nearest + di) % N;
+        //                     accum += glm::length(line[b] - line[a]);
+        //                     target = line[b];
+        //                     if (accum >= previewDist[pi]) break;
+        //                 }
+        //                 glm::vec2 rel = target - obs.pos;
+        //                 float x = glm::dot(rel, forward);
+        //                 float y = glm::dot(rel, right);
+        //                 obs.headingError[pi] = std::atan2(y, std::max(0.1f, x));
+        //                 float denom = x * x + y * y;
+        //                 obs.curvature[pi] = (denom > 1e-4f) ? (2.0f * y / denom) : 0.0f;
+        //             }
+        //         }
+        //     }
+        //
+        //     if (track) {
+        //         bool hasOuter = track->outerBoundary.size() >= 3;
+        //         bool hasInner = track->innerBoundary.size() >= 3;
+        //         obs.offTrack = (hasOuter && !pointInPolygon(obs.pos, track->outerBoundary)) ||
+        //                        (hasInner &&  pointInPolygon(obs.pos, track->innerBoundary));
+        //     }
+        //     return obs;
+        // }; */
 
         for (int ci = 0; ci < (int)cars.size(); ++ci) {
             Observation obs = buildObservation(ci);
             gSensorDebug.observations[ci] = obs;
+
+            if (trainingMode_ && isGenomeCar(ci)) {
+                if (ci >= (int)trainingFitness_.size()) trainingFitness_.resize(cars.size(), 0.0f);
+                if (ci >= (int)gaLastProgress_.size())  gaLastProgress_.resize(cars.size(), 0.0f);
+
+                float dp = obs.progress - gaLastProgress_[ci];
+                // Корректируем оборот (progress 0..1 цикличен)
+                if (dp < -0.5f) dp += 1.0f;
+                if (dp >  0.5f) dp -= 1.0f;
+
+                float reward = 0.f;
+
+                // Главная цель: продвижение вперёд по трассе
+                reward += std::max(0.0f, dp) * gaWProgress_;
+
+                // Бонус за темп (нормализуем к ~25 м/с)
+                reward += std::clamp(obs.speedAbs / 25.0f, 0.0f, 1.0f) * gaWSpeed_;
+
+                // Штраф за вылет за границу
+                if (obs.offTrack)           reward -= gaWOffTrack_;
+
+                // Штраф за стояние на месте (стимулирует движение)
+                if (obs.speedAbs < 0.5f)    reward -= gaWStall_;
+
+                // Штраф за плохую ориентацию относительно трассы
+                reward -= std::min(std::abs(obs.headingError[0]), 1.5f) * gaWHeading_;
+
+                // Бонус за близость к центральной линии (небольшой)
+                if (obs.distToCenterline > 0.f) {
+                    float normDist = std::clamp(obs.distToCenterline / 5.0f, 0.0f, 1.0f);
+                    reward -= normDist * 0.003f;
+                }
+
+                trainingFitness_[ci] += reward;
+                gaLastProgress_[ci]   = obs.progress;
+            }
 
             if (carIsAI[ci]) {
                 VehicleControls ctrl{};
@@ -746,19 +818,21 @@ void CarGame::update(float deltaTime) {
 
                 cars[ci]->setControls(ctrl.throttle, ctrl.brake, ctrl.steer, ctrl.handbrake);
 
-                if (datasetRecording_ && datasetLogger_.isOpen() && !useNeuralController_ && ci == 0) {
+                if (datasetRecording_ && datasetLogger_.isOpen() && ci == 0 &&
+                    aiConfigs_[ci].type == AIControllerType::NONE) {
                     datasetLogger_.logSample(obs, ctrl, STEP, ci, true, "scripted_ai");
-                }
-                if (datasetRecording_ && datasetLogger_.isOpen() && !useNeuralController_ && ci == activeCarIndex && !carIsAI[ci]) {
+                    }
+            } else {
+                if (datasetRecording_ && datasetLogger_.isOpen() && ci == activeCarIndex) {
                     VehicleControls playerCtrl{};
                     playerCtrl.throttle  = cars[ci]->getThrottle();
                     playerCtrl.brake     = cars[ci]->getBrake();
                     playerCtrl.steer     = cars[ci]->getSteer();
                     playerCtrl.handbrake = cars[ci]->isHandbrake();
-
                     datasetLogger_.logSample(obs, playerCtrl, STEP, ci, false, "player");
                 }
             }
+
             cars[ci]->fixedUpdate(STEP);
         }
 
@@ -783,6 +857,29 @@ void CarGame::update(float deltaTime) {
         }
 
         accumulator -= STEP;
+        substeps++;
+    }
+
+    if (substeps >= maxSubstepsPerFrame_ && accumulator > STEP * 4.0f) {
+        accumulator = STEP * 4.0f;
+    }
+
+    if (trainingMode_ && trainingRunning_) {
+        trainingElapsed_ += deltaTime * simSpeedMultiplier_;
+        if (trainingElapsed_ >= trainingEpisodeTime_) {
+            bool hasGenomeCars = false;
+            for (int i = 0; i < (int)cars.size(); ++i) {
+                if (isGenomeCar(i)) { hasGenomeCars = true; break; }
+            }
+
+            if (hasGenomeCars) {
+                advanceGAGeneration();
+            } else if (trainingAutoReset_) {
+                resetTrainingEpisode();
+            } else {
+                trainingRunning_ = false;
+            }
+        }
     }
 
     // Вне трассы/штрафы и тайминг считаем по кадру
@@ -908,7 +1005,8 @@ void CarGame::render() {
             debugRenderer().flush(mvp, 1.0f, 0.88f, 0.0f, 0.40f);
         }
 
-        if (gSensorDebug.show && activeCarIndex >= 0 && activeCarIndex < (int)gSensorDebug.observations.size()) {
+        if (lidarEnabled_ && showLidarRays_ && gSensorDebug.show &&
+                activeCarIndex >= 0 && activeCarIndex < (int)gSensorDebug.observations.size()) {
             const Observation& obs = gSensorDebug.observations[activeCarIndex];
             for (int i = 0; i < Observation::kRayCount; ++i) {
                 float t = obs.rayDistance[i];
@@ -933,6 +1031,11 @@ void CarGame::render() {
         trackEditor->render();
     }
 
+    // ── GA Monitor — отдельное окно ────────────────────────────────────────────
+    if (trainingMode_ && showGAMonitor_) {
+        gaMonitor_.renderWindow(&showGAMonitor_);
+    }
+
     Car* car = activeCar();
 
     // 6. ОТРИСОВКА ИНТЕРФЕЙСА (HUD и Окна редактора)
@@ -948,6 +1051,58 @@ void CarGame::render() {
                 car->reset(spawnPos, track ? track->spawnYawRad : 0.0f);
                 telemetry->reset();
             }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Simulation");
+        ImGui::SliderFloat("Sim speed", &simSpeedMultiplier_, 0.1f, 10.0f, "%.1fx");
+        ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
+        ImGui::TextDisabled("F9 start/stop run | F10 reset episode | F11 lidar");
+        ImGui::Text("Training elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
+        if (trainingMode_ && !trainingFitness_.empty()) {
+            float bestFit = trainingFitness_[0];
+            for (float f : trainingFitness_) bestFit = std::max(bestFit, f);
+            ImGui::Text("Best fitness: %.3f", bestFit);
+        }
+        ImGui::Checkbox("Training mode", &trainingMode_);
+        ImGui::Checkbox("Training running", &trainingRunning_);
+        ImGui::Checkbox("Training auto reset", &trainingAutoReset_);
+        ImGui::SliderFloat("Episode time", &trainingEpisodeTime_, 5.0f, 220.0f, "%.1f s");
+
+        ImGui::Separator();
+        // Компактный GA-блок — детали вынесены в отдельное окно
+        if (ImGui::CollapsingHeader("GA Training")) {
+            ImGui::Checkbox("Training mode",    &trainingMode_);
+            ImGui::Checkbox("Show GA monitor",  &showGAMonitor_);
+            ImGui::Text("Generation: %d   Sigma: %.4f", gaGeneration_, gaMutationSigma_);
+            if (!trainingFitness_.empty()) {
+                float best = *std::max_element(trainingFitness_.begin(), trainingFitness_.end());
+                ImGui::Text("Best fitness this ep: %.3f", best);
+            }
+            ImGui::Text("Best ever: %.3f", gaBestFitnessEver_);
+            if (ImGui::Button("Open GA Monitor")) showGAMonitor_ = true;
+        }
+
+        if (ImGui::Button("Setup GA population")) {
+            setupGAPopulation();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save best genome")) {
+            saveBestGenome();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Sensors");
+        ImGui::Checkbox("Lidar enabled", &lidarEnabled_);
+        ImGui::Checkbox("Show lidar rays", &showLidarRays_);
+
+        ImGui::Separator();
+        ImGui::Text("Cars interaction");
+        int modeIdx = (interactionMode_ == CarInteractionMode::GHOSTS) ? 0 : 1;
+        const char* modeNames[] = { "Ghosts", "Collisions" };
+        if (ImGui::Combo("Mode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames))) {
+            interactionMode_ = (modeIdx == 0) ? CarInteractionMode::GHOSTS : CarInteractionMode::COLLISIONS;
+            rebuildCarCollisionMasks();
         }
 
         if (car && telemetry && ImGui::CollapsingHeader("Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1104,9 +1259,13 @@ void CarGame::render() {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ai ? ImVec4(1,1,1,1) : ImVec4(0.3f,1.0f,0.5f,1.0f));
 
-            char label[96];
-            snprintf(label, sizeof(label), "%s#%-2d  %3.0f km/h  (%4.0f,%4.0f)",
-                     ai ? "[AI] " : "[P]  ", i, spd_kmh, pos.x, pos.y);
+            char label[128];
+            const char* ctrlName = "Player";
+            if (ai && i < (int)aiConfigs_.size()) {
+                ctrlName = controllerTypeName(aiConfigs_[i].type);
+            }
+            snprintf(label, sizeof(label), "%s#%-2d [%s]  %3.0f km/h  (%4.0f,%4.0f)",
+                     ai ? "[AI] " : "[P]  ", i, ctrlName, spd_kmh, pos.x, pos.y);
 
             if (ImGui::Selectable(label, hilit, ImGuiSelectableFlags_AllowDoubleClick)) {
                 // Одиночный — следить камерой
@@ -1141,6 +1300,54 @@ void CarGame::render() {
                     aiWaypointIndex[i] = 0;
                     if (activeCarIndex == i) spectatorMode = true;
                 }
+                if (ai) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("AI Policy");
+
+                    int typeIdx = 0;
+                    if (i < (int)aiConfigs_.size()) {
+                        switch (aiConfigs_[i].type) {
+                            case AIControllerType::NONE:                typeIdx = 0; break;
+                            case AIControllerType::RANDOM:              typeIdx = 1; break;
+                            case AIControllerType::BEHAVIORAL_CLONING:  typeIdx = 2; break;
+                            case AIControllerType::GENOME:              typeIdx = 3; break;
+                        }
+                    }
+
+                    const char* aiTypes[] = { "Scripted", "Random", "BC", "Genome" };
+                    if (ImGui::Combo("Type", &typeIdx, aiTypes, IM_ARRAYSIZE(aiTypes))) {
+                        if (i < (int)aiConfigs_.size()) {
+                            aiConfigs_[i].type =
+                                (typeIdx == 0) ? AIControllerType::NONE :
+                                (typeIdx == 1) ? AIControllerType::RANDOM :
+                                (typeIdx == 2) ? AIControllerType::BEHAVIORAL_CLONING :
+                                                 AIControllerType::GENOME;
+                            assignControllerForCar(i);
+                        }
+                    }
+                    if (i < (int)aiConfigs_.size()) {
+                        char pathBuf[256];
+                        std::memset(pathBuf, 0, sizeof(pathBuf));
+                        const std::string& src = aiConfigs_[i].modelPath.empty() ? modelPath_ : aiConfigs_[i].modelPath;
+                        std::strncpy(pathBuf, src.c_str(), sizeof(pathBuf) - 1);
+
+                        if (ImGui::InputText("Model path", pathBuf, sizeof(pathBuf))) {
+                            aiConfigs_[i].modelPath = pathBuf;
+                        }
+                    }
+
+                    if (i < (int)aiConfigs_.size()) {
+                        bool coll = aiConfigs_[i].collidesWithCars;
+                        if (ImGui::Checkbox("Collides with cars", &coll)) {
+                            aiConfigs_[i].collidesWithCars = coll;
+                            rebuildCarCollisionMasks();
+                        }
+                    }
+
+                    if (ImGui::Button("Reload controller")) {
+                        assignControllerForCar(i);
+                    }
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Follow cam")) {
                     spectatorTarget = i;
@@ -1153,6 +1360,7 @@ void CarGame::render() {
                     else { p = {(float)i*2.5f, 0}; yaw = 0; }
                     cars[i]->reset(p, yaw);
                     if (i < (int)aiWaypointIndex.size()) aiWaypointIndex[i] = 0;
+                    rebuildCarCollisionMasks();
                 }
                 if (ai && ImGui::MenuItem("Remove")) {
                     cars.erase(cars.begin() + i);
@@ -1292,6 +1500,46 @@ void CarGame::handleInput() {
     }
     f8Pressed = f8Now;
 
+    static bool f9Pressed  = false;
+    static bool f10Pressed = false;
+    static bool f11Pressed = false;
+
+    bool f9Now  = glfwGetKey(currentWindow, GLFW_KEY_F9)  == GLFW_PRESS;
+    bool f10Now = glfwGetKey(currentWindow, GLFW_KEY_F10) == GLFW_PRESS;
+    bool f11Now = glfwGetKey(currentWindow, GLFW_KEY_F11) == GLFW_PRESS;
+
+    if (f9Now && !f9Pressed) {
+        trainingRunning_ = !trainingRunning_;
+        if (trainingRunning_) {
+            trainingElapsed_ = 0.0f;
+            std::cout << "Training run: ON" << std::endl;
+        } else {
+            std::cout << "Training run: OFF" << std::endl;
+        }
+    }
+    f9Pressed = f9Now;
+
+    if (f10Now && !f10Pressed) {
+        resetTrainingEpisode();
+        std::cout << "Training episode reset" << std::endl;
+    }
+    f10Pressed = f10Now;
+
+    if (f11Now && !f11Pressed) {
+        lidarEnabled_ = !lidarEnabled_;
+        std::cout << "Lidar: " << (lidarEnabled_ ? "ON" : "OFF") << std::endl;
+    }
+    f11Pressed = f11Now;
+
+    static bool f12Pressed = false;
+    bool f12Now = glfwGetKey(currentWindow, GLFW_KEY_F12) == GLFW_PRESS;
+
+    if (f12Now && !f12Pressed) {
+        setupGAPopulation();
+        std::cout << "GA population setup" << std::endl;
+    }
+    f12Pressed = f12Now;
+
     // Get control inputs
     if (spectatorMode) {
         // Spectator free cam — WASD двигают камеру (обрабатывается в updateCamera)
@@ -1339,6 +1587,7 @@ void CarGame::handleInput() {
             car->reset(spawnPos, spawnYawRad);
         }
         if (telemetry) telemetry->reset();
+        rebuildCarCollisionMasks();
     }
     rPressed = rCurrentlyPressed;
 }
@@ -1350,6 +1599,19 @@ void CarGame::resize(int width, int height) {
     }
 }
 
+void CarGame::rebuildCarCollisionMasks() {
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        if (!cars[i]) continue;
+
+        bool enabled = (interactionMode_ == CarInteractionMode::COLLISIONS);
+
+        if (i < (int)aiConfigs_.size()) {
+            enabled = enabled && aiConfigs_[i].collidesWithCars;
+        }
+
+        cars[i]->setCarCollisionEnabled(enabled);
+    }
+}
 
 void CarGame::shutdown() {
     // Вместо hud().shutdown() используем прямые вызовы очистки ImGui
@@ -1368,6 +1630,281 @@ void CarGame::shutdown() {
     cars.clear();
     telemetry.reset();
     track.reset();
+}
+
+static float frandRange(uint32_t& seed, float a, float b) {
+    seed = 1664525u * seed + 1013904223u;
+    float t = (float)(seed & 0x00FFFFFF) / (float)0x01000000;
+    return a + (b - a) * t;
+}
+
+void CarGame::getSpawnPoseForCar(int idx, glm::vec2& outPos, float& outYaw) {
+    if (trainingMode_ && trainingSpawnSinglePoint_) {
+        uint32_t s = gaSeed_ + 7919u * (uint32_t)idx;
+        outPos = trainingSpawnPos_;
+        outPos.x += frandRange(s, -trainingSpawnJitterPos_, trainingSpawnJitterPos_);
+        outPos.y += frandRange(s, -trainingSpawnJitterPos_, trainingSpawnJitterPos_);
+        outYaw = trainingSpawnYaw_ + frandRange(s, -trainingSpawnJitterYaw_, trainingSpawnJitterYaw_);
+        return;
+    }
+
+    if (track) gridSlotPose(track->startGrid, idx, outPos, outYaw);
+    else { outPos = {(float)idx * 2.5f, 0.0f}; outYaw = 0.0f; }
+}
+
+bool CarGame::isGenomeCar(int carIdx) const {
+    return carIdx >= 0 &&
+           carIdx < (int)cars.size() &&
+           carIdx < (int)carIsAI.size() &&
+           carIdx < (int)aiConfigs_.size() &&
+           carIsAI[carIdx] &&
+           aiConfigs_[carIdx].type == AIControllerType::GENOME;
+}
+
+void CarGame::resetGAFitness() {
+    trainingFitness_.assign(cars.size(), 0.0f);
+    gaLastProgress_.assign(cars.size(), 0.0f);
+}
+
+void CarGame::saveBestGenome() {
+    int bestIdx = -1;
+    float bestFit = -1e30f;
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        if (!isGenomeCar(i)) continue;
+        if (i < (int)trainingFitness_.size() && trainingFitness_[i] > bestFit) {
+            bestFit = trainingFitness_[i];
+            bestIdx = i;
+        }
+    }
+    if (bestIdx >= 0 && bestIdx < (int)gaGenomes_.size()) {
+        GenomeController gc(gaGenomes_[bestIdx]);
+        std::string err;
+        if (!gc.saveGenome(gaBestGenomePath_, &err)) {
+            std::cerr << "Save best genome failed: " << err << std::endl;
+        } else {
+            std::cout << "Saved best genome -> " << gaBestGenomePath_
+                      << "  fitness=" << bestFit << std::endl;
+        }
+    }
+}
+
+void CarGame::setupGAPopulation() {
+    int currentAI = 0;
+    for (bool ai : carIsAI) if (ai) ++currentAI;
+
+    while (currentAI < gaPopulationSize_) {
+        addAICar();
+        ++currentAI;
+    }
+    while (currentAI > gaPopulationSize_) {
+        removeLastAICar();
+        --currentAI;
+    }
+
+    gaGenomes_.resize(cars.size());
+    trainingFitness_.resize(cars.size(), 0.0f);
+    gaLastProgress_.resize(cars.size(), 0.0f);
+
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        if (!carIsAI[i]) continue;
+
+        aiConfigs_[i].type = AIControllerType::GENOME;
+        aiConfigs_[i].modelPath.clear();
+
+        gaGenomes_[i] = GenomeController::makeRandom(gaSeed_++, gaHiddenSize_, 0.35f);
+        aiControllers[i] = std::make_unique<GenomeController>(gaGenomes_[i]);
+        aiWaypointIndex[i] = 0;
+    }
+
+    gaGeneration_ = 0;
+    trainingMode_ = true;
+    trainingRunning_ = true;
+    resetTrainingEpisode();
+    resetGAFitness();
+    gaBestFitnessEver_    = -1e30f;
+    gaBestFitnessLastGen_ = -1e30f;
+    gaStagnationCounter_  = 0;
+    // gaMonitor_.clear();   // раскомментировать если хотите сбрасывать историю графиков
+    rebuildCarCollisionMasks();
+}
+
+GenerationStats CarGame::collectGenerationStats() const {
+    GenerationStats s;
+    s.generation    = gaGeneration_;
+    s.populationSize= gaPopulationSize_;
+    s.eliteCount    = gaEliteCount_;
+    s.mutationSigma = gaMutationSigma_;
+    s.episodeTime   = trainingEpisodeTime_;
+
+    // Собираем только геном-машины
+    std::vector<int> ids;
+    for (int i = 0; i < (int)cars.size(); ++i)
+        if (isGenomeCar(i)) ids.push_back(i);
+
+    if (ids.empty()) return s;
+
+    // Cортируем по убыванию фитнеса (для таблицы популяции)
+    std::vector<int> sorted = ids;
+    std::sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+        float fa = (a < (int)trainingFitness_.size()) ? trainingFitness_[a] : -1e30f;
+        float fb = (b < (int)trainingFitness_.size()) ? trainingFitness_[b] : -1e30f;
+        return fa > fb;
+    });
+
+    float sumFit = 0.f, sumProg = 0.f, sumSpd = 0.f;
+    float wFit = -1e30f, wFit2 = 1e30f;
+
+    s.individuals.reserve(sorted.size());
+    for (int rank = 0; rank < (int)sorted.size(); ++rank) {
+        int ci = sorted[rank];
+        float fit  = (ci < (int)trainingFitness_.size()) ? trainingFitness_[ci] : 0.f;
+        float prog = (ci < (int)gaLastProgress_.size())  ? gaLastProgress_[ci]  : 0.f;
+        float spd  = cars[ci]->getSpeed();
+
+        GenerationStats::Individual ind;
+        ind.fitness  = fit;
+        ind.progress = prog;
+        ind.speed    = std::abs(spd);
+        ind.isElite  = (rank < gaEliteCount_);
+        s.individuals.push_back(ind);
+
+        sumFit += fit;
+        sumProg+= prog;
+        sumSpd += ind.speed;
+        wFit    = std::max(wFit,  fit);
+        wFit2   = std::min(wFit2, fit);
+    }
+
+    const float N = (float)sorted.size();
+    s.bestFitness  = wFit;
+    s.meanFitness  = sumFit / N;
+    s.worstFitness = wFit2;
+    s.bestProgress = 0.f;
+    s.meanProgress = sumProg / N;
+    s.meanSpeed    = sumSpd  / N;
+    for (const auto& ind : s.individuals)
+        s.bestProgress = std::max(s.bestProgress, ind.progress);
+
+    // Diversity: std отклонение L2-норм геномов
+    if (!gaGenomes_.empty()) {
+        std::vector<float> norms;
+        for (int ci : sorted) {
+            if (ci >= (int)gaGenomes_.size()) continue;
+            const auto& g = gaGenomes_[ci].genes;
+            float norm2 = 0.f;
+            for (float w : g) norm2 += w * w;
+            norms.push_back(std::sqrt(norm2));
+        }
+        if (!norms.empty()) {
+            float mean = 0.f;
+            for (float v : norms) mean += v;
+            mean /= (float)norms.size();
+            float var = 0.f;
+            for (float v : norms) var += (v - mean) * (v - mean);
+            s.diversity = std::sqrt(var / (float)norms.size());
+        }
+    }
+
+    return s;
+}
+
+void CarGame::adaptMutationSigma(float bestFitnessThisGen) {
+    constexpr int kStagnationLimit   = 4;     // поколений без улучшения → повышаем sigma
+    constexpr float kSigmaDecay      = 0.92f; // при прогрессе уменьшаем
+    constexpr float kSigmaBoost      = 1.12f; // при стагнации повышаем
+    constexpr float kSigmaMin        = 0.008f;
+    constexpr float kSigmaMax        = 0.55f;
+
+    if (bestFitnessThisGen > gaBestFitnessLastGen_ + 1e-4f) {
+        // Есть прогресс — сжимаем sigma (эксплуатация)
+        gaMutationSigma_  *= kSigmaDecay;
+        gaStagnationCounter_ = 0;
+    } else {
+        // Стагнация
+        ++gaStagnationCounter_;
+        if (gaStagnationCounter_ >= kStagnationLimit) {
+            // Расширяем sigma (исследование)
+            gaMutationSigma_  *= kSigmaBoost;
+            gaStagnationCounter_ = 0;
+        }
+    }
+
+    gaMutationSigma_ = std::clamp(gaMutationSigma_, kSigmaMin, kSigmaMax);
+    gaBestFitnessLastGen_ = std::max(gaBestFitnessLastGen_, bestFitnessThisGen);
+    gaBestFitnessEver_    = std::max(gaBestFitnessEver_,    bestFitnessThisGen);
+}
+
+void CarGame::advanceGAGeneration() {
+    std::vector<int> ids;
+    for (int i = 0; i < (int)cars.size(); ++i)
+        if (isGenomeCar(i)) ids.push_back(i);
+    if (ids.empty()) return;
+
+    // ── A. Собираем статистику ДО смены геномов ───────────────────────────────
+    GenerationStats stats = collectGenerationStats();
+
+    // ── B. Адаптируем sigma ───────────────────────────────────────────────────
+    adaptMutationSigma(stats.bestFitness);
+
+    // После adaptMutationSigma sigma уже обновлена — пишем актуальное значение
+    stats.mutationSigma = gaMutationSigma_;
+    gaMonitor_.addGeneration(stats);
+
+    // ── C. Сортируем по фитнесу ───────────────────────────────────────────────
+    std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+        float fa = (a < (int)trainingFitness_.size()) ? trainingFitness_[a] : -1e30f;
+        float fb = (b < (int)trainingFitness_.size()) ? trainingFitness_[b] : -1e30f;
+        return fa > fb;
+    });
+
+    saveBestGenome();
+
+    // ── D. Эволюция: элита + кроссовер + мутация ─────────────────────────────
+    std::mt19937 rng(gaSeed_++);
+    std::vector<GenomeSpec> next = gaGenomes_;
+    int eliteCount = std::clamp(gaEliteCount_, 1, (int)ids.size());
+
+    // Строим список рангов (индексов в ids) для турнира
+    std::vector<int> ranks((int)ids.size());
+    std::iota(ranks.begin(), ranks.end(), 0);  // 0,1,2,...
+
+    for (int rank = eliteCount; rank < (int)ids.size(); ++rank) {
+        int dstCar = ids[rank];
+
+        // Турнирная выборка двух родителей
+        int paRank = tournamentPick(ranks, rng, 3);
+        int pbRank = tournamentPick(ranks, rng, 3);
+        if (paRank < 0) paRank = 0;
+        if (pbRank < 0) pbRank = 0;
+
+        int paIdx = ids[paRank];
+        int pbIdx = ids[pbRank];
+
+        const GenomeSpec& A = gaGenomes_[paIdx];
+        const GenomeSpec& B = gaGenomes_[pbIdx];
+        GenomeSpec child = crossoverGenome(A, B, rng);
+        mutateGenome(child, rng, gaMutationProbability_, gaMutationSigma_);
+        next[dstCar] = std::move(child);
+    }
+
+    gaGenomes_ = std::move(next);
+
+    for (int idx : ids) {
+        aiControllers[idx] = std::make_unique<GenomeController>(gaGenomes_[idx]);
+        aiWaypointIndex[idx] = 0;
+    }
+
+    ++gaGeneration_;
+    resetTrainingEpisode();
+    resetGAFitness();
+    trainingRunning_ = true;
+
+    std::cout << "[GA] Gen " << gaGeneration_
+              << "  best=" << stats.bestFitness
+              << "  mean=" << stats.meanFitness
+              << "  prog=" << stats.bestProgress * 100.f << "%"
+              << "  σ=" << gaMutationSigma_
+              << std::endl;
 }
 
 bool CarGame::loadTrack() {
@@ -1490,7 +2027,6 @@ void CarGame::createArenaBounds() {
     arenaBoundsBody->CreateFixture(&fd);
 }
 
-
 void CarGame::createObstacles() {
     createWallBox(glm::vec2(10.0f, 10.0f), 6.0f, 1.0f, 25.0f * M_PI / 180.0f);
     createWallBox(glm::vec2(-15.0f, 5.0f), 1.0f, 8.0f, 0.0f);
@@ -1603,7 +2139,13 @@ void CarGame::setEditorMode(bool enabled) {
     }
 }
 
-
+void CarGame::resetTrainingEpisode() {
+    resetAllCarsToGrid();
+    trainingElapsed_ = 0.0f;
+    for (int& wp : aiWaypointIndex) wp = 0;
+    gaLastProgress_.assign(cars.size(), 0.0f);
+    if (telemetry) telemetry->reset();
+}
 
 void CarGame::renderTrackBackground() {
     // Placeholder - in a real implementation this would draw a textured quad
@@ -1742,8 +2284,173 @@ void CarGame::addAICar() {
     carIsAI.push_back(true);
 
     static uint32_t aiSeed = 42;
-    aiControllers.push_back(std::make_unique<RandomController>(aiSeed++));
+    aiControllers.push_back(nullptr);//std::make_unique<RandomController>(aiSeed++));
     aiWaypointIndex.push_back(0);
+
+    aiConfigs_.push_back(CarAIConfig{});
+    aiConfigs_.back().type = AIControllerType::NONE; // scripted by default
+    aiConfigs_.back().collidesWithCars = true;
+    trainingFitness_.push_back(0.0f);
+    gaGenomes_.resize(cars.size());
+    gaLastProgress_.resize(cars.size(), 0.0f);
+
+    assignControllerForCar((int)cars.size() - 1);
+    rebuildCarCollisionMasks();
+}
+
+Observation CarGame::buildObservation(int ci) const {
+    Observation obs;
+    if (ci < 0 || ci >= (int)cars.size() || !cars[ci]) return obs;
+
+    const Car* c = cars[ci].get();
+    obs.pos          = c->getPosition();
+    obs.speed        = c->getSpeed();
+    obs.speedForward = c->getSpeed();
+    obs.speedAbs     = std::abs(c->getSpeed());
+    obs.yaw          = c->getAngleRad();
+    obs.steer        = c->getSteer();
+    obs.surfaceMu    = c->getSurfaceMu();
+
+    const glm::vec2 forward(std::cos(obs.yaw), std::sin(obs.yaw));
+    const glm::vec2 right(-std::sin(obs.yaw), std::cos(obs.yaw));
+    const float maxRayLen = 22.0f;
+
+    auto testSeg = [&](const glm::vec2& ro, const glm::vec2& rd, float curBest,
+                       const glm::vec2& a, const glm::vec2& b) {
+        float t = raySegmentHit(ro, rd, a, b);
+        return (t >= 0.0f && t < curBest) ? t : curBest;
+    };
+
+    bool needLidar = false;
+
+    if (lidarEnabled_) {
+        if (showLidarRays_ && ci == activeCarIndex) {
+            needLidar = true;
+        }
+        if (ci >= 0 && ci < (int)aiConfigs_.size()) {
+            AIControllerType t = aiConfigs_[ci].type;
+            if (t == AIControllerType::GENOME || t == AIControllerType::BEHAVIORAL_CLONING) {
+                needLidar = true;
+            }
+        }
+    }
+
+    if (needLidar) {
+        for (int i = 0; i < Observation::kRayCount; ++i) {
+            float ang = glm::two_pi<float>() * (float)i / (float)Observation::kRayCount;
+            glm::vec2 rd(std::cos(obs.yaw + ang), std::sin(obs.yaw + ang));
+            glm::vec2 ro = obs.pos;
+            float best = maxRayLen;
+
+            if (track) {
+                const auto testPolyline = [&](const std::vector<glm::vec2>& poly, bool closed) {
+                    if (poly.size() < 2) return;
+                    const int n = (int)poly.size();
+                    const int segs = closed ? n : (n - 1);
+                    for (int s = 0; s < segs; ++s) {
+                        best = testSeg(ro, rd, best, poly[s], poly[(s + 1) % n]);
+                    }
+                };
+
+                testPolyline(track->outerBoundary, true);
+                testPolyline(track->innerBoundary, true);
+
+                for (const auto& wall : track->walls) {
+                    const int wn = (int)wall.vertices.size();
+                    if (wn < 2) continue;
+                    for (int k = 0; k < wn - 1; ++k) {
+                        const glm::vec2 a = wall.vertices[k];
+                        const glm::vec2 b = wall.vertices[k + 1];
+                        glm::vec2 seg = b - a;
+                        float len = glm::length(seg);
+                        if (len < 1e-4f) continue;
+                        glm::vec2 tang = seg / len;
+                        glm::vec2 norm(-tang.y, tang.x);
+                        glm::vec2 off = norm * (0.5f * wall.thickness);
+                        const glm::vec2 p0 = a + off;
+                        const glm::vec2 p1 = b + off;
+                        const glm::vec2 p2 = b - off;
+                        const glm::vec2 p3 = a - off;
+                        best = testSeg(ro, rd, best, p0, p1);
+                        best = testSeg(ro, rd, best, p1, p2);
+                        best = testSeg(ro, rd, best, p2, p3);
+                        best = testSeg(ro, rd, best, p3, p0);
+                    }
+                }
+            }
+
+            obs.rayDistance[i] = std::clamp(best / maxRayLen, 0.0f, 1.0f);
+            obs.rayStart[i] = ro;
+            obs.rayEnd[i] = ro + rd * best;
+        }
+    } else {
+        for (int i = 0; i < Observation::kRayCount; ++i) {
+            obs.rayDistance[i] = 1.0f;
+            obs.rayStart[i] = obs.pos;
+            obs.rayEnd[i] = obs.pos;
+        }
+    }
+
+    if (track && track->racingLine.size() >= 2) {
+        const int ctrlN = (int)track->racingLine.size();
+        const std::vector<glm::vec2>& line =
+            (splineCacheVersion == ctrlN && splineCache.size() >= 2) ? splineCache : track->racingLine;
+        const int N = (int)line.size();
+        if (N >= 2) {
+            int nearest = (ci < (int)aiWaypointIndex.size()) ? aiWaypointIndex[ci] : 0;
+            nearest = std::clamp(nearest, 0, N - 1);
+
+            float bestD2 = 1e30f;
+            const int window = std::min(N, 160);
+            for (int di = 0; di < window; ++di) {
+                int idx = (nearest + di) % N;
+                glm::vec2 d = line[idx] - obs.pos;
+                float d2 = glm::dot(d, d);
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    nearest = idx;
+                } else if (di > 8 && d2 > bestD2 * 6.0f) {
+                    break;
+                }
+            }
+
+            obs.progress = (float)nearest / (float)std::max(1, N);
+            obs.distToCenterline = std::sqrt(std::max(0.0f, bestD2));
+
+            const std::array<float, 3> previewDist = {{
+                std::clamp(4.0f  + obs.speedAbs * 0.18f, 3.0f, 10.0f),
+                std::clamp(8.0f  + obs.speedAbs * 0.25f, 6.0f, 18.0f),
+                std::clamp(14.0f + obs.speedAbs * 0.33f, 10.0f, 28.0f)
+            }};
+
+            for (int pi = 0; pi < 3; ++pi) {
+                glm::vec2 target = line[(nearest + 1) % N];
+                float accum = 0.0f;
+                for (int di = 1; di < N; ++di) {
+                    int a = (nearest + di - 1) % N;
+                    int b = (nearest + di) % N;
+                    accum += glm::length(line[b] - line[a]);
+                    target = line[b];
+                    if (accum >= previewDist[pi]) break;
+                }
+                glm::vec2 rel = target - obs.pos;
+                float x = glm::dot(rel, forward);
+                float y = glm::dot(rel, right);
+                obs.headingError[pi] = std::atan2(y, std::max(0.1f, x));
+                float denom = x*x + y*y;
+                obs.curvature[pi] = (denom > 1e-4f) ? (2.0f * y / denom) : 0.0f;
+            }
+        }
+    }
+
+    if (track) {
+        bool hasOuter = track->outerBoundary.size() >= 3;
+        bool hasInner = track->innerBoundary.size() >= 3;
+        obs.offTrack = (hasOuter && !pointInPolygon(obs.pos, track->outerBoundary)) ||
+                       (hasInner &&  pointInPolygon(obs.pos, track->innerBoundary));
+    }
+
+    return obs;
 }
 
 void CarGame::removeLastAICar() {
@@ -1756,7 +2463,75 @@ void CarGame::removeLastAICar() {
                 aiWaypointIndex.erase(aiWaypointIndex.begin() + i);
             activeCarIndex  = std::min(activeCarIndex,  (int)cars.size()-1);
             spectatorTarget = std::min(spectatorTarget, (int)cars.size()-1);
+            if (i < (int)aiConfigs_.size())
+                aiConfigs_.erase(aiConfigs_.begin() + i);
+            if (i < (int)trainingFitness_.size())
+                trainingFitness_.erase(trainingFitness_.begin() + i);
+            if (i < (int)gaGenomes_.size())
+                gaGenomes_.erase(gaGenomes_.begin() + i);
+            if (i < (int)gaLastProgress_.size())
+                gaLastProgress_.erase(gaLastProgress_.begin() + i);
+            rebuildCarCollisionMasks();
             return;
+        }
+    }
+}
+
+const char* CarGame::controllerTypeName(AIControllerType t) const {
+    switch (t) {
+        case AIControllerType::NONE: return "Scripted";
+        case AIControllerType::RANDOM: return "Random";
+        case AIControllerType::BEHAVIORAL_CLONING: return "BC";
+        case AIControllerType::GENOME: return "Genome";
+        default: return "Unknown";
+    }
+}
+
+void CarGame::assignControllerForCar(int carIdx) {
+    if (carIdx < 0 || carIdx >= (int)cars.size()) return;
+    if (carIdx >= (int)aiControllers.size()) return;
+    if (carIdx >= (int)aiConfigs_.size()) return;
+
+    aiControllers[carIdx].reset();
+
+    const auto& cfg = aiConfigs_[carIdx];
+    switch (cfg.type) {
+        case AIControllerType::NONE:
+            break; // scripted fallback
+        case AIControllerType::RANDOM:
+            aiControllers[carIdx] = std::make_unique<RandomController>(1234u + (uint32_t)carIdx);
+            break;
+        case AIControllerType::BEHAVIORAL_CLONING: {
+            auto bc = std::make_unique<BehavioralCloningController>();
+            std::string err;
+            if (!bc->loadModel(cfg.modelPath.empty() ? modelPath_ : cfg.modelPath, &err)) {
+                std::cerr << "BC load failed for car " << carIdx << ": " << err << std::endl;
+            } else {
+                aiControllers[carIdx] = std::move(bc);
+            }
+            break;
+        }
+        case AIControllerType::GENOME: {
+            auto gc = std::make_unique<GenomeController>();
+            std::string err;
+
+            if (!cfg.modelPath.empty()) {
+                if (!gc->loadGenome(cfg.modelPath, &err)) {
+                    std::cerr << "Genome load failed for car " << carIdx << ": " << err << std::endl;
+                    if (carIdx >= (int)gaGenomes_.size()) gaGenomes_.resize(cars.size());
+                    gaGenomes_[carIdx] = GenomeController::makeRandom(gaSeed_++, gaHiddenSize_, 0.35f);
+                    gc->setGenome(gaGenomes_[carIdx]);
+                }
+            } else {
+                if (carIdx >= (int)gaGenomes_.size()) gaGenomes_.resize(cars.size());
+                if (gaGenomes_[carIdx].genes.empty()) {
+                    gaGenomes_[carIdx] = GenomeController::makeRandom(gaSeed_++, gaHiddenSize_, 0.35f);
+                }
+                gc->setGenome(gaGenomes_[carIdx]);
+            }
+
+            aiControllers[carIdx] = std::move(gc);
+            break;
         }
     }
 }
@@ -2066,4 +2841,5 @@ void CarGame::resetAllCarsToGrid() {
         cars[i]->reset(p, yaw);
     }
     if (telemetry) telemetry->reset();
+    rebuildCarCollisionMasks();
 }

@@ -1,0 +1,7 @@
+Files to add to project:
+- include/GenomeController.h
+- src/GenomeController.cpp
+
+Also add them to CMakeLists.txt.
+
+Key patches in existing files are described in the assistant response.

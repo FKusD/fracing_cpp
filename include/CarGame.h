@@ -10,6 +10,9 @@
 #include "ObservationDatasetLogger.h"
 #include "BehavioralCloningController.h"
 #include "RandomController.h"
+#include "GenomeController.h"
+#include <cstdint>
+#include "GATrainingMonitor.h"
 
 
 class Controller;
@@ -39,6 +42,8 @@ public:
     }
 
     void setEditorMode(bool enabled);// {
+    void resetTrainingEpisode();
+
     //     if (trackEditor) {
     //         trackEditor->setMode(active ? EditorMode::EDIT_WALLS : EditorMode::PLAY);
     //     }
@@ -47,6 +52,84 @@ public:
     VehicleControls computeRacingLineControls(int carIdx);
 
 private:
+    enum class CarInteractionMode {
+        GHOSTS = 0,
+        COLLISIONS
+    };
+
+    struct CarAIConfig {
+        AIControllerType type = AIControllerType::NONE; // NONE = scripted fallback
+        std::string modelPath;
+        bool collidesWithCars = true;
+    };
+    std::vector<CarAIConfig> aiConfigs_;
+    std::vector<float> trainingFitness_;
+
+    CarInteractionMode interactionMode_ = CarInteractionMode::COLLISIONS;
+
+    float simSpeedMultiplier_ = 1.0f;
+    int maxSubstepsPerFrame_ = 8;
+
+    bool trainingMode_ = false;
+    bool trainingUseAllCores_ = false; // пока задел под будущее
+
+    bool lidarEnabled_ = true;
+    bool showLidarRays_ = true;
+
+    float trainingEpisodeTime_ = 20.0f;
+    float trainingElapsed_ = 0.0f;
+    bool trainingAutoReset_ = false;
+    bool trainingRunning_ = false;
+
+    std::vector<GenomeSpec> gaGenomes_;
+    std::vector<float> gaLastProgress_;
+
+    int gaGeneration_ = 0;
+    int gaPopulationSize_ = 16;
+    int gaEliteCount_ = 4;
+    int gaHiddenSize_ = 24;
+
+    float gaMutationSigma_ = 0.18f;
+    float gaMutationProbability_ = 0.12f;
+
+    // ── GA Monitor ──────────────────────────────────────────────────────────────
+    GATrainingMonitor gaMonitor_;
+    bool showGAMonitor_ = true;         // показывать ли окно
+
+    // ── Adaptive sigma ──────────────────────────────────────────────────────────
+    float gaBestFitnessEver_     = -1e30f;  // лучший фитнес за всё время
+    float gaBestFitnessLastGen_  = -1e30f;  // лучший в предыдущем поколении
+    int   gaStagnationCounter_   = 0;       // счётчик поколений без улучшения
+
+    // ── Fitness weights (вынесено для удобства тюнинга из UI) ──────────────────
+    float gaWProgress_     = 300.f;   // вес за продвижение вперёд
+    float gaWSpeed_        = 0.01f;   // бонус за скорость
+    float gaWOffTrack_     = 0.08f;   // штраф за вылет
+    float gaWStall_        = 0.02f;   // штраф за стояние
+    float gaWHeading_      = 0.005f;  // штраф за плохую ориентацию
+
+    uint32_t gaSeed_ = 1337u;
+    std::string gaBestGenomePath_ = "ga_best_genome.json";
+
+    void setupGAPopulation();
+    void advanceGAGeneration();
+    void resetGAFitness();
+    void saveBestGenome();
+    bool isGenomeCar(int carIdx) const;
+
+    bool trainingSpawnSinglePoint_ = true;
+    glm::vec2 trainingSpawnPos_ = glm::vec2(0.0f, 0.0f);
+    float trainingSpawnYaw_ = 0.0f;
+    float trainingSpawnJitterPos_ = 0.35f;
+    float trainingSpawnJitterYaw_ = 0.10f;
+
+    void getSpawnPoseForCar(int idx, glm::vec2& outPos, float& outYaw);
+
+    Observation buildObservation(int carIdx) const;
+    void rebuildCarCollisionMasks();
+    void assignControllerForCar(int carIdx);
+    const char* controllerTypeName(AIControllerType t) const;
+
     // УЛУЧШЕННЫЙ ЗУМ: уменьшаем VIEW_W и VIEW_H для увеличения машины на экране
     // Было: 32x18, стало: 24x13.5 (примерно 33% увеличение)
     static constexpr float VIEW_W = 24.0f;  // было 32.0f
@@ -113,6 +196,10 @@ private:
     void updateCamera();
     void renderHud();
     void renderTrackBackground();
+
+    GenerationStats collectGenerationStats() const;
+    void            renderGAMonitorWindow();
+    void            adaptMutationSigma(float bestFitnessThisGen);
 
     // ── Тайминг круга/секторов ──────────────────────────────────────────────
     struct LapTiming {

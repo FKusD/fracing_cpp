@@ -68,4 +68,5 @@ void ObservationDatasetLogger::logSample(const Observation& obs,
          << carIndex << ","
          << (isAI ? 1 : 0) << ","
          << sourceTag << "\n";
+    out_.flush();
 }

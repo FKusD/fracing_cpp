@@ -2,11 +2,17 @@
 #include "VehicleControls.h"
 #include <glm/glm.hpp>
 #include <array>
+#include <string>
+
+enum class AIControllerType {
+    NONE = 0,        // scripted fallback из CarGame
+    RANDOM,
+    BEHAVIORAL_CLONING,
+    GENOME
+};
 
 struct Observation {
-    static constexpr int kRaysPerCorner = 8;
-    static constexpr int kCornerCount = 4;
-    static constexpr int kRayCount = kRaysPerCorner * kCornerCount;
+    static constexpr int kRayCount = 24; // 360 / 15 deg
 
     float speed = 0.0f;
     float speedForward = 0.0f;
@@ -22,6 +28,7 @@ struct Observation {
 
     std::array<float, 3> headingError{{0.0f, 0.0f, 0.0f}};
     std::array<float, 3> curvature{{0.0f, 0.0f, 0.0f}};
+
     std::array<float, kRayCount> rayDistance{};
     std::array<glm::vec2, kRayCount> rayStart{};
     std::array<glm::vec2, kRayCount> rayEnd{};

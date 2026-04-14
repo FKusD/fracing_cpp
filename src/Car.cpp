@@ -124,6 +124,25 @@ float Car::getSpeed() const {
     return state.v;
 }
 
+void Car::setCarCollisionEnabled(bool enabled) {
+    if (!body) return;
+
+    // category 0x0002 = cars
+    // mask:
+    //  - enabled  -> collide with everything
+    //  - disabled -> collide with everything except cars
+    constexpr uint16 kCarCategory = 0x0002;
+    constexpr uint16 kAllMask     = 0xFFFF;
+    constexpr uint16 kNoCarsMask  = static_cast<uint16>(kAllMask & ~kCarCategory);
+
+    for (b2Fixture* f = body->GetFixtureList(); f; f = f->GetNext()) {
+        b2Filter flt = f->GetFilterData();
+        flt.categoryBits = kCarCategory;
+        flt.maskBits = enabled ? kAllMask : kNoCarsMask;
+        f->SetFilterData(flt);
+    }
+}
+
 void Car::createBody(const glm::vec2& startPos) {
     b2BodyDef bd;
     bd.type = b2_dynamicBody;
@@ -150,5 +169,12 @@ void Car::createBody(const glm::vec2& startPos) {
     // ИСПРАВЛЕНИЕ: Уменьшаем отскок для более реалистичных столкновений
     fd.restitution = 0.05f; // было 0.15f - теперь почти нет отскока
 
-    body->CreateFixture(&fd);
+    b2Fixture* fx = body->CreateFixture(&fd);
+
+    // categoryBits = cars
+    // maskBits по умолчанию collide with all
+    b2Filter flt = fx->GetFilterData();
+    flt.categoryBits = 0x0002;
+    flt.maskBits     = 0xFFFF;
+    fx->SetFilterData(flt);
 }

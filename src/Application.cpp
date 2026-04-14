@@ -127,7 +127,7 @@ bool Application::initialize() {
     }
 #endif
 
-    glfwSwapInterval(1);
+    glfwSwapInterval(0);
 
     game = std::make_unique<CarGame>();
     if (!game->initialize()) {

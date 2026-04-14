@@ -77,6 +77,8 @@ add_executable(fracing_cpp
         src/RandomController.cpp
         src/ObservationDatasetLogger.cpp
         src/BehavioralCloningController.cpp
+        src/GenomeController.cpp
+        src/GATrainingMonitor.cpp
 )
 
 add_library(glad STATIC

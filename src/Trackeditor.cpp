@@ -338,7 +338,7 @@ void TrackEditor::handleMouseButton(int button, int action, double mouseX, doubl
     // ── Pick radius: ~12px в мировых единицах ────────────────────────────────
     float aspect = (float)viewportWidth / std::max(1, viewportHeight);
     float viewH  = 30.0f / std::max(0.05f, cameraZoom);
-    float pickR  = viewH / (float)viewportHeight * 14.0f;
+    float pickR  = viewH / (float)viewportHeight * 28.0f;
 
     // ── ЛКМ НАЖАТА ───────────────────────────────────────────────────────────
     if (button == 0 && action == 1) {
@@ -411,7 +411,7 @@ void TrackEditor::handleMouseButton(int button, int action, double mouseX, doubl
     // ── ЛКМ ОТПУЩЕНА ─────────────────────────────────────────────────────────
     if (button == 0 && action == 0 && isDraggingPoint) {
         isDraggingPoint = false;
-        selObjType      = SelType::NONE;
+        // selObjType      = SelType::NONE;
         addHistoryState("Move point");
         isDirty = true;
     }
@@ -799,7 +799,7 @@ void TrackEditor::renderSelectionHandles() {
 
         // ручки (out-handle) + линия до них
         if (currentTrack->racingLineOutHandle.size() == currentTrack->racingLine.size()) {
-            float s = 0.18f;
+            float s = 0.30f;
             for (int i = 0; i < (int)currentTrack->racingLine.size(); ++i) {
                 const glm::vec2 p  = currentTrack->racingLine[i];
                 const glm::vec2 hp = p + currentTrack->racingLineOutHandle[i];
@@ -1593,6 +1593,34 @@ void TrackEditor::renderPropertiesWindow() {
             }
         }
         ImGui::SetItemTooltip("Insert point between each pair");
+
+        ImGui::SameLine();
+        if (ImGui::Button("Insert near cursor")) {
+            auto& rl = currentTrack->racingLine;
+            if (rl.size() >= 2) {
+                int bestSeg = 0;
+                float bestD2 = 1e30f;
+                glm::vec2 bestMid{0,0};
+                for (int i = 0; i < (int)rl.size(); ++i) {
+                    int j = (i + 1) % (int)rl.size();
+                    glm::vec2 mid = (rl[i] + rl[j]) * 0.5f;
+                    glm::vec2 d = mid - mouseWorldPos;
+                    float d2 = glm::dot(d, d);
+                    if (d2 < bestD2) {
+                        bestD2 = d2;
+                        bestSeg = i;
+                        bestMid = mid;
+                    }
+                }
+                rl.insert(rl.begin() + bestSeg + 1, bestMid);
+                currentTrack->racingLineOutHandle.resize(rl.size());
+                for (int i = 0; i < (int)rl.size(); ++i)
+                    currentTrack->racingLineOutHandle[i] =
+                        (rl[(i+1)%rl.size()] - rl[(i-1+(int)rl.size())%(int)rl.size()]) * splineTension;
+                addHistoryState("Insert racing point");
+                isDirty = true;
+            }
+        }
 
         ImGui::SameLine();
         if (ImGui::Button("Smooth")) {
