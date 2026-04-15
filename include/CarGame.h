@@ -65,6 +65,29 @@ private:
     std::vector<CarAIConfig> aiConfigs_;
     std::vector<float> trainingFitness_;
 
+    struct TrainingCarState {
+        float trackPos01 = 0.0f;
+        float prevTrackPos01 = 0.0f;
+        float forwardAlignment = 0.0f;   // cos between car forward and track tangent
+        float validProgressDelta = 0.0f;
+        float bestTrackPos01 = 0.0f;
+
+        int lapCount = 0;
+        int invalidFinishAttempts = 0;
+
+        bool wrongWay = false;
+        float wrongWayTime = 0.0f;
+        float reverseProgressTime = 0.0f;
+        float trackForwardDot = 0.0f;
+        bool crossedFinishForward = false;
+    };
+
+    std::vector<TrainingCarState> trainingCars_;
+    float bestGenerationFitness_ = -1e30f;
+    int bestGenerationCarIdx_ = -1;
+
+    void updateTrainingCarState(int carIdx, const Observation& obs);
+
     CarInteractionMode interactionMode_ = CarInteractionMode::COLLISIONS;
 
     float simSpeedMultiplier_ = 1.0f;

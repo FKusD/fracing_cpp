@@ -25,6 +25,8 @@ struct Observation {
     bool offTrack = false;
 
     glm::vec2 pos = {0,0};
+    glm::vec2 trackTangent = {1.0f, 0.0f};
+    float trackForwardDot = 0.0f;
 
     std::array<float, 3> headingError{{0.0f, 0.0f, 0.0f}};
     std::array<float, 3> curvature{{0.0f, 0.0f, 0.0f}};

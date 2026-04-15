@@ -536,6 +536,9 @@ bool CarGame::initialize() {
         aiConfigs_.push_back(CarAIConfig{});
     }
     trainingFitness_.assign(cars.size(), 0.0f);
+    trainingCars_.assign(cars.size(), TrainingCarState{});
+    bestGenerationFitness_ = -1e30f;
+    bestGenerationCarIdx_ = -1;
     rebuildCarCollisionMasks();
 
     // Create telemetry system
@@ -771,40 +774,47 @@ void CarGame::update(float deltaTime) {
             Observation obs = buildObservation(ci);
             gSensorDebug.observations[ci] = obs;
 
-            if (trainingMode_ && isGenomeCar(ci)) {
+            if (trainingMode_) {
                 if (ci >= (int)trainingFitness_.size()) trainingFitness_.resize(cars.size(), 0.0f);
-                if (ci >= (int)gaLastProgress_.size())  gaLastProgress_.resize(cars.size(), 0.0f);
+                if (ci >= (int)trainingCars_.size())    trainingCars_.resize(cars.size());
 
-                float dp = obs.progress - gaLastProgress_[ci];
-                // Корректируем оборот (progress 0..1 цикличен)
-                if (dp < -0.5f) dp += 1.0f;
-                if (dp >  0.5f) dp -= 1.0f;
+                updateTrainingCarState(ci, obs);
+                const auto& st = trainingCars_[ci];
 
-                float reward = 0.f;
+                float reward = 0.0f;
 
-                // Главная цель: продвижение вперёд по трассе
-                reward += std::max(0.0f, dp) * gaWProgress_;
+                // Главный сигнал — валидный прогресс по трассе
+                reward += st.validProgressDelta * 400.0f;
 
-                // Бонус за темп (нормализуем к ~25 м/с)
-                reward += std::clamp(obs.speedAbs / 25.0f, 0.0f, 1.0f) * gaWSpeed_;
+                // Небольшой бонус за движение вперёд по направлению трассы
+                reward += std::clamp(st.forwardAlignment, -1.0f, 1.0f) * 0.01f;
 
-                // Штраф за вылет за границу
-                if (obs.offTrack)           reward -= gaWOffTrack_;
-
-                // Штраф за стояние на месте (стимулирует движение)
-                if (obs.speedAbs < 0.5f)    reward -= gaWStall_;
-
-                // Штраф за плохую ориентацию относительно трассы
-                reward -= std::min(std::abs(obs.headingError[0]), 1.5f) * gaWHeading_;
-
-                // Бонус за близость к центральной линии (небольшой)
-                if (obs.distToCenterline > 0.f) {
-                    float normDist = std::clamp(obs.distToCenterline / 5.0f, 0.0f, 1.0f);
-                    reward -= normDist * 0.003f;
+                // Маленький бонус за темп, но только если не едет в обратную сторону
+                if (!st.wrongWay) {
+                    reward += std::clamp(obs.speedAbs / 20.0f, 0.0f, 1.0f) * 0.01f;
                 }
 
+                if (st.wrongWayTime > 1.5f) reward -= 0.5f;
+
+                // Большой бонус за валидный круг
+                if (st.crossedFinishForward) {
+                    reward += 100.0f;
+                }
+
+                // Штрафы
+                if (obs.offTrack)      reward -= 0.08f;
+                if (st.wrongWay)       reward -= 0.12f;
+                if (obs.speedAbs < 0.5f) reward -= 0.02f;
+
+                // Штраф за чит у финиша
+                reward -= st.invalidFinishAttempts * 2.0f;
+
                 trainingFitness_[ci] += reward;
-                gaLastProgress_[ci]   = obs.progress;
+
+                if (trainingFitness_[ci] > bestGenerationFitness_) {
+                    bestGenerationFitness_ = trainingFitness_[ci];
+                    bestGenerationCarIdx_ = ci;
+                }
             }
 
             if (carIsAI[ci]) {
@@ -1059,6 +1069,8 @@ void CarGame::render() {
         ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
         ImGui::TextDisabled("F9 start/stop run | F10 reset episode | F11 lidar");
         ImGui::Text("Training elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
+        ImGui::Text("Best generation fitness: %.3f", bestGenerationFitness_);
+        ImGui::Text("Best car idx: %d", bestGenerationCarIdx_);
         if (trainingMode_ && !trainingFitness_.empty()) {
             float bestFit = trainingFitness_[0];
             for (float f : trainingFitness_) bestFit = std::max(bestFit, f);
@@ -1202,6 +1214,115 @@ void CarGame::render() {
         }
         ImGui::End();
     }
+
+    if (showHud) {
+        ImGui::Begin("Training", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::Text("Episode");
+        ImGui::Checkbox("Training mode", &trainingMode_);
+        ImGui::Checkbox("Training running", &trainingRunning_);
+        ImGui::Checkbox("Training auto reset", &trainingAutoReset_);
+        ImGui::SliderFloat("Episode time", &trainingEpisodeTime_, 5.0f, 120.0f, "%.1f s");
+        ImGui::Text("Elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
+
+        ImGui::Separator();
+        ImGui::Text("Simulation");
+        ImGui::SliderFloat("Sim speed", &simSpeedMultiplier_, 0.1f, 10.0f, "%.1fx");
+        ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
+
+        ImGui::Separator();
+        ImGui::Text("Sensors");
+        ImGui::Checkbox("Lidar enabled", &lidarEnabled_);
+        ImGui::Checkbox("Show lidar rays", &showLidarRays_);
+
+        ImGui::Separator();
+        ImGui::Text("Spawn");
+        ImGui::Checkbox("Single-point training spawn", &trainingSpawnSinglePoint_);
+        ImGui::InputFloat2("Spawn pos", &trainingSpawnPos_.x);
+        ImGui::SliderFloat("Spawn yaw", &trainingSpawnYaw_, -3.14159f, 3.14159f, "%.2f");
+        ImGui::SliderFloat("Spawn jitter pos", &trainingSpawnJitterPos_, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Spawn jitter yaw", &trainingSpawnJitterYaw_, 0.0f, 0.5f, "%.3f");
+
+        ImGui::Separator();
+        ImGui::Text("Genetic");
+        ImGui::SliderInt("GA population", &gaPopulationSize_, 2, 64);
+        ImGui::SliderInt("GA elite", &gaEliteCount_, 1, 16);
+        ImGui::SliderInt("GA hidden", &gaHiddenSize_, 8, 64);
+        ImGui::SliderFloat("GA mutation sigma", &gaMutationSigma_, 0.01f, 0.5f, "%.3f");
+        ImGui::SliderFloat("GA mutation prob", &gaMutationProbability_, 0.01f, 0.5f, "%.3f");
+        ImGui::Text("Generation: %d", gaGeneration_);
+        ImGui::Text("Best gen fitness: %.3f", bestGenerationFitness_);
+        ImGui::Text("Best car: %d", bestGenerationCarIdx_);
+
+        if (ImGui::Button("Setup GA population")) setupGAPopulation();
+        ImGui::SameLine();
+        if (ImGui::Button("Save best genome")) saveBestGenome();
+
+        ImGui::Separator();
+        ImGui::TextDisabled("F9 start/stop | F10 reset episode | F11 lidar | F12 setup GA");
+
+        ImGui::End();
+    }
+
+    if (showHud && trainingMode_ && !trainingCars_.empty()) {
+        ImGui::Begin("Training Agents", nullptr, ImGuiWindowFlags_None);
+
+        if (ImGui::BeginTable("training_agents_table", 10,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
+            ImGuiTableFlags_ScrollY)) {
+
+            ImGui::TableSetupColumn("Car");
+            ImGui::TableSetupColumn("Type");
+            ImGui::TableSetupColumn("Fitness");
+            ImGui::TableSetupColumn("Pos01");
+            ImGui::TableSetupColumn("Lap");
+            ImGui::TableSetupColumn("dProg");
+            ImGui::TableSetupColumn("Dot");
+            ImGui::TableSetupColumn("WrongWay");
+            ImGui::TableSetupColumn("BadFinish");
+            ImGui::TableSetupColumn("Speed");
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < (int)cars.size(); ++i) {
+                if (i >= (int)trainingCars_.size()) continue;
+
+                const auto& st = trainingCars_[i];
+                float fit = (i < (int)trainingFitness_.size()) ? trainingFitness_[i] : 0.0f;
+                float spd = cars[i] ? std::abs(cars[i]->getSpeed()) * 3.6f : 0.0f;
+                const char* typeName = (i < (int)aiConfigs_.size())
+                    ? controllerTypeName(aiConfigs_[i].type)
+                    : "Unknown";
+
+                ImGui::TableNextRow();
+
+                ImGui::TableSetColumnIndex(0);
+                if (i == bestGenerationCarIdx_)
+                    ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f), "#%d", i);
+                else
+                    ImGui::Text("#%d", i);
+
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%s", typeName);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", fit);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", st.trackPos01);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%d", st.lapCount);
+                ImGui::TableSetColumnIndex(5); ImGui::Text("%.5f", st.validProgressDelta);
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%.2f", st.trackForwardDot);
+
+                ImGui::TableSetColumnIndex(7);
+                if (st.wrongWay)
+                    ImGui::TextColored(ImVec4(1.0f,0.3f,0.3f,1.0f), "YES");
+                else
+                    ImGui::TextColored(ImVec4(0.4f,1.0f,0.4f,1.0f), "NO");
+
+                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", st.invalidFinishAttempts);
+                ImGui::TableSetColumnIndex(9); ImGui::Text("%.1f", spd);
+            }
+
+            ImGui::EndTable();
+        }
+
+    ImGui::End();
+}
 
     // ─── Окно "Cars" ──────────────────────────────────────────────────────────
     {
@@ -2142,9 +2263,63 @@ void CarGame::setEditorMode(bool enabled) {
 void CarGame::resetTrainingEpisode() {
     resetAllCarsToGrid();
     trainingElapsed_ = 0.0f;
+
     for (int& wp : aiWaypointIndex) wp = 0;
-    gaLastProgress_.assign(cars.size(), 0.0f);
+
+    trainingFitness_.assign(cars.size(), 0.0f);
+    trainingCars_.assign(cars.size(), TrainingCarState{});
+
+    bestGenerationFitness_ = -1e30f;
+    bestGenerationCarIdx_ = -1;
+
     if (telemetry) telemetry->reset();
+}
+
+void CarGame::updateTrainingCarState(int ci, const Observation& obs) {
+    if (ci < 0 || ci >= (int)cars.size()) return;
+    if (ci >= (int)trainingCars_.size()) trainingCars_.resize(cars.size());
+
+    auto& st = trainingCars_[ci];
+    st.crossedFinishForward = false;
+
+    const float prev = st.trackPos01;
+    const float cur  = obs.progress;
+
+    st.prevTrackPos01 = prev;
+    st.trackPos01     = cur;
+    st.bestTrackPos01 = std::max(st.bestTrackPos01, cur);
+
+    float dp = cur - prev;
+    if (dp < -0.5f) dp += 1.0f;
+    if (dp >  0.5f) dp -= 1.0f;
+
+    st.trackForwardDot = obs.trackForwardDot;
+    st.forwardAlignment = obs.trackForwardDot;
+
+    bool backwardByHeading  = (obs.trackForwardDot < -0.25f);
+    bool backwardByProgress = (dp < -1e-4f);
+
+    if (backwardByHeading) st.wrongWayTime += STEP;
+    else st.wrongWayTime = std::max(0.0f, st.wrongWayTime - STEP * 0.5f);
+
+    if (backwardByProgress) st.reverseProgressTime += STEP;
+    else st.reverseProgressTime = std::max(0.0f, st.reverseProgressTime - STEP * 0.5f);
+
+    st.wrongWay = (st.wrongWayTime > 0.35f) || (st.reverseProgressTime > 0.35f);
+
+    st.validProgressDelta = (!st.wrongWay && dp > 0.0f) ? dp : 0.0f;
+
+    bool wrappedForward = (prev > 0.85f && cur < 0.15f);
+    bool wrappedBackwardCheat = (prev < 0.15f && cur > 0.85f);
+
+    if (wrappedForward && !st.wrongWay && obs.trackForwardDot > 0.2f) {
+        st.lapCount += 1;
+        st.crossedFinishForward = true;
+    }
+
+    if (wrappedBackwardCheat || (wrappedForward && st.wrongWay)) {
+        st.invalidFinishAttempts += 1;
+    }
 }
 
 void CarGame::renderTrackBackground() {
@@ -2291,6 +2466,7 @@ void CarGame::addAICar() {
     aiConfigs_.back().type = AIControllerType::NONE; // scripted by default
     aiConfigs_.back().collidesWithCars = true;
     trainingFitness_.push_back(0.0f);
+    trainingCars_.push_back(TrainingCarState{});
     gaGenomes_.resize(cars.size());
     gaLastProgress_.resize(cars.size(), 0.0f);
 
@@ -2414,6 +2590,16 @@ Observation CarGame::buildObservation(int ci) const {
                 }
             }
 
+            int prevIdx = (nearest - 1 + N) % N;
+            int nextIdx = (nearest + 1) % N;
+            glm::vec2 tan = line[nextIdx] - line[prevIdx];
+            float tanLen = glm::length(tan);
+            if (tanLen > 1e-5f) tan /= tanLen;
+            else tan = forward;
+
+            obs.trackTangent = tan;
+            obs.trackForwardDot = glm::dot(forward, tan);
+
             obs.progress = (float)nearest / (float)std::max(1, N);
             obs.distToCenterline = std::sqrt(std::max(0.0f, bestD2));
 
@@ -2467,6 +2653,8 @@ void CarGame::removeLastAICar() {
                 aiConfigs_.erase(aiConfigs_.begin() + i);
             if (i < (int)trainingFitness_.size())
                 trainingFitness_.erase(trainingFitness_.begin() + i);
+            if (i < (int)trainingCars_.size())
+                trainingCars_.erase(trainingCars_.begin() + i);
             if (i < (int)gaGenomes_.size())
                 gaGenomes_.erase(gaGenomes_.begin() + i);
             if (i < (int)gaLastProgress_.size())
