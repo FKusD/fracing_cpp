@@ -126,4 +126,23 @@ else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -pedantic)
 endif()
 
-file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+# Runtime data (копируется в папку сборки рядом с exe)
+
+# assets
+if(EXISTS ${CMAKE_SOURCE_DIR}/assets)
+    file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+endif()
+
+# tracks
+if(EXISTS ${CMAKE_SOURCE_DIR}/tracks)
+    file(COPY ${CMAKE_SOURCE_DIR}/tracks DESTINATION ${CMAKE_BINARY_DIR})
+endif()
+
+# нейросетевые json
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/bc_policy.json)
+    file(COPY ${CMAKE_SOURCE_DIR}/scripts/bc_policy.json DESTINATION ${CMAKE_BINARY_DIR})
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/ga_best_genome.json)
+    file(COPY ${CMAKE_SOURCE_DIR}/scripts/ga_best_genome.json DESTINATION ${CMAKE_BINARY_DIR})
+endif()
