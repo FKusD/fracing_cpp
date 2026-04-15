@@ -38,8 +38,8 @@ jobs:
 
           Copy-Item $exe.FullName package/
 
-          if (Test-Path "build/assets") {
-            Copy-Item "build/assets" "package/assets" -Recurse -Force
+          if (Test-Path "build/tracks") {
+            Copy-Item "build/tracks" "package/tracks" -Recurse -Force
           }
 
           if (Test-Path "bc_policy.json") {
