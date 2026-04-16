@@ -65,21 +65,43 @@ private:
     std::vector<CarAIConfig> aiConfigs_;
     std::vector<float> trainingFitness_;
 
+    struct TrainingGate {
+        glm::vec2 a;
+        glm::vec2 b;
+        glm::vec2 center;
+    };
+
     struct TrainingCarState {
         float trackPos01 = 0.0f;
         float prevTrackPos01 = 0.0f;
-        float forwardAlignment = 0.0f;   // cos between car forward and track tangent
+
+        float forwardAlignment = 0.0f;
+        float trackForwardDot = 0.0f;
         float validProgressDelta = 0.0f;
         float bestTrackPos01 = 0.0f;
+
+        float wrongWayTime = 0.0f;
+        float reverseProgressTime = 0.0f;
 
         int lapCount = 0;
         int invalidFinishAttempts = 0;
 
         bool wrongWay = false;
-        float wrongWayTime = 0.0f;
-        float reverseProgressTime = 0.0f;
-        float trackForwardDot = 0.0f;
         bool crossedFinishForward = false;
+        bool hardWrongWay = false;
+        bool everWrongWay = false;
+        bool disqualified = false;
+
+        float bestTotalProgress = 0.0f;     // лучший достигнутый общий прогресс: круги + позиция
+        float rewardedProgress  = 0.0f;     // до какого общего прогресса уже выдавали награду
+        float stuckTime         = 0.0f;     // время без нового честного прогресса
+        float finishCampTime    = 0.0f;     // время зависания около финиша
+
+        int nextGateIndex = 0;
+        int gatesPassedThisLap = 0;
+        int completedLaps = 0;
+        float lastGateHitTime = 0.0f;
+        float gateRewardProgress = 0.0f;
     };
 
     std::vector<TrainingCarState> trainingCars_;
@@ -87,8 +109,15 @@ private:
     int bestGenerationCarIdx_ = -1;
 
     void updateTrainingCarState(int carIdx, const Observation& obs);
+    void updateBestTrainingAgent();
 
     CarInteractionMode interactionMode_ = CarInteractionMode::COLLISIONS;
+
+    std::vector<TrainingGate> trainingGates_;
+    int trainingGateCount_ = 32;
+    bool autoBuildTrainingGates_ = true;
+    bool showTrainingGates_ = false;
+    float trainingGateHalfWidth_ = 4.0f;
 
     float simSpeedMultiplier_ = 1.0f;
     int maxSubstepsPerFrame_ = 8;
@@ -98,6 +127,11 @@ private:
 
     bool lidarEnabled_ = true;
     bool showLidarRays_ = true;
+
+    bool showTrainingWindow_ = true;
+    bool showAgentsWindow_   = true;
+    bool showTelemetryWindow_ = true;
+    bool showLapWindow_ = true;
 
     float trainingEpisodeTime_ = 20.0f;
     float trainingElapsed_ = 0.0f;
@@ -209,6 +243,10 @@ private:
     // ── Пауза и выход ────────────────────────────────────────────────────
     bool isPaused        = false;
     bool showQuitConfirm = false;
+
+    void rebuildTrainingGates();
+    void updateTrainingGateProgress(int carIdx, const Observation& obs);
+    bool segmentIntersectsGate(const glm::vec2& p0, const glm::vec2& p1, const TrainingGate& g) const;
 
     void createArenaBounds();
     void createObstacles();

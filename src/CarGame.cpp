@@ -81,6 +81,21 @@ static float cross2(const glm::vec2& a, const glm::vec2& b) {
     return a.x * b.y - a.y * b.x;
 }
 
+static bool segmentsIntersect2D(const glm::vec2& p, const glm::vec2& p2,
+                                    const glm::vec2& q, const glm::vec2& q2) {
+    glm::vec2 r = p2 - p;
+    glm::vec2 s = q2 - q;
+    float den = cross2(r, s);
+
+    if (std::abs(den) < 1e-8f) return false;
+
+    glm::vec2 qp = q - p;
+    float t = cross2(qp, s) / den;
+    float u = cross2(qp, r) / den;
+
+    return (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f);
+}
+
 static glm::vec2 rotateLocal(const glm::vec2& forward, const glm::vec2& right, float angleRad) {
     return std::cos(angleRad) * forward + std::sin(angleRad) * right;
 }
@@ -508,6 +523,10 @@ bool CarGame::initialize() {
         buildTrackCollision();
     }
 
+    if (autoBuildTrainingGates_) {
+        rebuildSplineCache();
+        rebuildTrainingGates();
+    }
 
     // Create car at spawn
     const glm::vec2 spawnPos = (trackOk && track) ? track->spawnPos : glm::vec2(0.0f, 0.0f);
@@ -574,6 +593,11 @@ void CarGame::update(float deltaTime) {
     if (wasEditing && !nowEditing) {
         createArenaBounds();
         buildTrackCollision();
+
+        if (autoBuildTrainingGates_) {
+            rebuildSplineCache();
+            rebuildTrainingGates();
+        }
 
         if (track) {
             for (int i = 0; i < (int)cars.size(); ++i) {
@@ -778,43 +802,49 @@ void CarGame::update(float deltaTime) {
                 if (ci >= (int)trainingFitness_.size()) trainingFitness_.resize(cars.size(), 0.0f);
                 if (ci >= (int)trainingCars_.size())    trainingCars_.resize(cars.size());
 
-                updateTrainingCarState(ci, obs);
-                const auto& st = trainingCars_[ci];
+                auto& st = trainingCars_[ci];
+                st.crossedFinishForward = false;
+
+                updateTrainingGateProgress(ci, obs);
 
                 float reward = 0.0f;
 
-                // Главный сигнал — валидный прогресс по трассе
-                reward += st.validProgressDelta * 400.0f;
-
-                // Небольшой бонус за движение вперёд по направлению трассы
-                reward += std::clamp(st.forwardAlignment, -1.0f, 1.0f) * 0.01f;
-
-                // Маленький бонус за темп, но только если не едет в обратную сторону
-                if (!st.wrongWay) {
-                    reward += std::clamp(obs.speedAbs / 20.0f, 0.0f, 1.0f) * 0.01f;
+                // Главное: reward только за новый корректный gate
+                float newGateProgress = st.gateRewardProgress;
+                if (newGateProgress > 0.0f) {
+                    reward += newGateProgress * 100.0f;
+                    st.gateRewardProgress = 0.0f;
                 }
 
-                if (st.wrongWayTime > 1.5f) reward -= 0.5f;
-
-                // Большой бонус за валидный круг
+                // Большой бонус за завершение круга
                 if (st.crossedFinishForward) {
-                    reward += 100.0f;
+                    reward += 1000.0f;
                 }
 
-                // Штрафы
-                if (obs.offTrack)      reward -= 0.08f;
-                if (st.wrongWay)       reward -= 0.12f;
-                if (obs.speedAbs < 0.5f) reward -= 0.02f;
+                // Небольшой бонус за движение, если не стоит
+                if (obs.speedAbs > 0.5f)
+                    reward += 0.01f;
 
-                // Штраф за чит у финиша
-                reward -= st.invalidFinishAttempts * 2.0f;
+                // Off-track / wall-hugging
+                if (obs.offTrack)
+                    reward -= 0.10f;
+
+                float minRayAny = 1.0f;
+                for (int ri = 0; ri < Observation::kRayCount; ++ri)
+                    minRayAny = std::min(minRayAny, obs.rayDistance[ri]);
+
+                if (minRayAny < 0.03f)
+                    reward -= 0.40f;
+
+                // Если долго не проходит следующий gate — штраф
+                if ((trainingElapsed_ - st.lastGateHitTime) > 2.0f)
+                    reward -= 0.05f;
+
+                // Попытки перескочить не тот gate
+                if (st.invalidFinishAttempts > 0)
+                    reward -= 5.0f * (float)st.invalidFinishAttempts;
 
                 trainingFitness_[ci] += reward;
-
-                if (trainingFitness_[ci] > bestGenerationFitness_) {
-                    bestGenerationFitness_ = trainingFitness_[ci];
-                    bestGenerationCarIdx_ = ci;
-                }
             }
 
             if (carIsAI[ci]) {
@@ -844,6 +874,10 @@ void CarGame::update(float deltaTime) {
             }
 
             cars[ci]->fixedUpdate(STEP);
+        }
+
+        if (trainingMode_ && !trainingFitness_.empty()) {
+            updateBestTrainingAgent();
         }
 
         // 3) шаг Box2D
@@ -912,6 +946,19 @@ void CarGame::render() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("Windows")) {
+            ImGui::MenuItem("Game Debug",      nullptr, &showHud);
+            ImGui::MenuItem("Training",        nullptr, &showTrainingWindow_);
+            ImGui::MenuItem("Training Agents", nullptr, &showAgentsWindow_);
+            ImGui::MenuItem("Telemetry",       nullptr, &showTelemetryWindow_);
+            ImGui::MenuItem("Lap Timing",      nullptr, &showLapWindow_);
+            ImGui::MenuItem("Cars",            nullptr, nullptr, false); // Cars пока всегда открыто
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
 
     // 3. ОЧИСТКА ЭКРАНА
     glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
@@ -1015,6 +1062,25 @@ void CarGame::render() {
             debugRenderer().flush(mvp, 1.0f, 0.88f, 0.0f, 0.40f);
         }
 
+        if (showTrainingGates_ && !trainingGates_.empty()) {
+            for (int gi = 0; gi < (int)trainingGates_.size(); ++gi) {
+                const auto& g = trainingGates_[gi];
+
+                float r = 0.2f, gg = 0.8f, b = 1.0f, a = 0.8f;
+                if (!trainingCars_.empty() && bestGenerationCarIdx_ >= 0 &&
+                    bestGenerationCarIdx_ < (int)trainingCars_.size()) {
+                    int nextGate = trainingCars_[bestGenerationCarIdx_].nextGateIndex;
+                    if (gi == nextGate) {
+                        r = 1.0f; gg = 0.9f; b = 0.2f; a = 1.0f;
+                    }
+                    }
+
+                debugRenderer().addLine(b2Vec2(g.a.x, g.a.y), b2Vec2(g.b.x, g.b.y));
+                debugRenderer().flush(mvp, r, gg, b, a);
+                debugRenderer().beginFrame();
+            }
+        }
+
         if (lidarEnabled_ && showLidarRays_ && gSensorDebug.show &&
                 activeCarIndex >= 0 && activeCarIndex < (int)gSensorDebug.observations.size()) {
             const Observation& obs = gSensorDebug.observations[activeCarIndex];
@@ -1066,56 +1132,56 @@ void CarGame::render() {
         ImGui::Separator();
         ImGui::Text("Simulation");
         ImGui::SliderFloat("Sim speed", &simSpeedMultiplier_, 0.1f, 10.0f, "%.1fx");
-        ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
-        ImGui::TextDisabled("F9 start/stop run | F10 reset episode | F11 lidar");
-        ImGui::Text("Training elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
-        ImGui::Text("Best generation fitness: %.3f", bestGenerationFitness_);
-        ImGui::Text("Best car idx: %d", bestGenerationCarIdx_);
-        if (trainingMode_ && !trainingFitness_.empty()) {
-            float bestFit = trainingFitness_[0];
-            for (float f : trainingFitness_) bestFit = std::max(bestFit, f);
-            ImGui::Text("Best fitness: %.3f", bestFit);
-        }
-        ImGui::Checkbox("Training mode", &trainingMode_);
-        ImGui::Checkbox("Training running", &trainingRunning_);
-        ImGui::Checkbox("Training auto reset", &trainingAutoReset_);
-        ImGui::SliderFloat("Episode time", &trainingEpisodeTime_, 5.0f, 220.0f, "%.1f s");
+        // ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
+        // ImGui::TextDisabled("F9 start/stop run | F10 reset episode | F11 lidar");
+        // ImGui::Text("Training elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
+        // ImGui::Text("Best generation fitness: %.3f", bestGenerationFitness_);
+        // ImGui::Text("Best car idx: %d", bestGenerationCarIdx_);
+        // if (trainingMode_ && !trainingFitness_.empty()) {
+        //     float bestFit = trainingFitness_[0];
+        //     for (float f : trainingFitness_) bestFit = std::max(bestFit, f);
+        //     ImGui::Text("Best fitness: %.3f", bestFit);
+        // }
+        // ImGui::Checkbox("Training mode", &trainingMode_);
+        // ImGui::Checkbox("Training running", &trainingRunning_);
+        // ImGui::Checkbox("Training auto reset", &trainingAutoReset_);
+        // ImGui::SliderFloat("Episode time", &trainingEpisodeTime_, 5.0f, 220.0f, "%.1f s");
+        //
+        // ImGui::Separator();
+        // // Компактный GA-блок — детали вынесены в отдельное окно
+        // if (ImGui::CollapsingHeader("GA Training")) {
+        //     ImGui::Checkbox("Training mode",    &trainingMode_);
+        //     ImGui::Checkbox("Show GA monitor",  &showGAMonitor_);
+        //     ImGui::Text("Generation: %d   Sigma: %.4f", gaGeneration_, gaMutationSigma_);
+        //     if (!trainingFitness_.empty()) {
+        //         float best = *std::max_element(trainingFitness_.begin(), trainingFitness_.end());
+        //         ImGui::Text("Best fitness this ep: %.3f", best);
+        //     }
+        //     ImGui::Text("Best ever: %.3f", gaBestFitnessEver_);
+        //     if (ImGui::Button("Open GA Monitor")) showGAMonitor_ = true;
+        // }
+        //
+        // if (ImGui::Button("Setup GA population")) {
+        //     setupGAPopulation();
+        // }
+        // ImGui::SameLine();
+        // if (ImGui::Button("Save best genome")) {
+        //     saveBestGenome();
+        // }
 
-        ImGui::Separator();
-        // Компактный GA-блок — детали вынесены в отдельное окно
-        if (ImGui::CollapsingHeader("GA Training")) {
-            ImGui::Checkbox("Training mode",    &trainingMode_);
-            ImGui::Checkbox("Show GA monitor",  &showGAMonitor_);
-            ImGui::Text("Generation: %d   Sigma: %.4f", gaGeneration_, gaMutationSigma_);
-            if (!trainingFitness_.empty()) {
-                float best = *std::max_element(trainingFitness_.begin(), trainingFitness_.end());
-                ImGui::Text("Best fitness this ep: %.3f", best);
-            }
-            ImGui::Text("Best ever: %.3f", gaBestFitnessEver_);
-            if (ImGui::Button("Open GA Monitor")) showGAMonitor_ = true;
-        }
-
-        if (ImGui::Button("Setup GA population")) {
-            setupGAPopulation();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Save best genome")) {
-            saveBestGenome();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Sensors");
-        ImGui::Checkbox("Lidar enabled", &lidarEnabled_);
-        ImGui::Checkbox("Show lidar rays", &showLidarRays_);
-
-        ImGui::Separator();
-        ImGui::Text("Cars interaction");
-        int modeIdx = (interactionMode_ == CarInteractionMode::GHOSTS) ? 0 : 1;
-        const char* modeNames[] = { "Ghosts", "Collisions" };
-        if (ImGui::Combo("Mode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames))) {
-            interactionMode_ = (modeIdx == 0) ? CarInteractionMode::GHOSTS : CarInteractionMode::COLLISIONS;
-            rebuildCarCollisionMasks();
-        }
+        // ImGui::Separator();
+        // ImGui::Text("Sensors");
+        // ImGui::Checkbox("Lidar enabled", &lidarEnabled_);
+        // ImGui::Checkbox("Show lidar rays", &showLidarRays_);
+        //
+        // ImGui::Separator();
+        // ImGui::Text("Cars interaction");
+        // int modeIdx = (interactionMode_ == CarInteractionMode::GHOSTS) ? 0 : 1;
+        // const char* modeNames[] = { "Ghosts", "Collisions" };
+        // if (ImGui::Combo("Mode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames))) {
+        //     interactionMode_ = (modeIdx == 0) ? CarInteractionMode::GHOSTS : CarInteractionMode::COLLISIONS;
+        //     rebuildCarCollisionMasks();
+        // }
 
         if (car && telemetry && ImGui::CollapsingHeader("Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
             const auto& s = telemetry->getLatest();
@@ -1139,6 +1205,20 @@ void CarGame::render() {
                             obs.headingError[0], obs.headingError[1], obs.headingError[2]);
                 ImGui::Text("Curvature:   %.3f  %.3f  %.3f",
                             obs.curvature[0], obs.curvature[1], obs.curvature[2]);
+            }
+            if (trainingMode_ && activeCarIndex >= 0 && activeCarIndex < (int)trainingCars_.size()) {
+                const auto& st = trainingCars_[activeCarIndex];
+                ImGui::Separator();
+                ImGui::Text("Training state");
+                ImGui::Text("Track pos: %.4f", st.trackPos01);
+                ImGui::Text("Lap count: %d", st.lapCount);
+                ImGui::Text("Track dot: %.3f", st.trackForwardDot);
+                ImGui::Text("Valid dProg: %.5f", st.validProgressDelta);
+                ImGui::Text("Wrong way: %s", st.wrongWay ? "YES" : "NO");
+                ImGui::Text("Hard wrong-way: %s", st.hardWrongWay ? "YES" : "NO");
+                ImGui::Text("Ever wrong-way: %s", st.everWrongWay ? "YES" : "NO");
+                ImGui::Text("Disqualified: %s", st.disqualified ? "YES" : "NO");
+                ImGui::Text("Invalid finish attempts: %d", st.invalidFinishAttempts);
             }
         }
 
@@ -1215,7 +1295,127 @@ void CarGame::render() {
         ImGui::End();
     }
 
-    if (showHud) {
+    if (showTrainingWindow_) {
+        ImGui::Begin("Training", &showTrainingWindow_, ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::Text("Episode");
+        ImGui::Checkbox("Training mode", &trainingMode_);
+        ImGui::Checkbox("Training running", &trainingRunning_);
+        ImGui::Checkbox("Training auto reset", &trainingAutoReset_);
+        ImGui::SliderFloat("Episode time", &trainingEpisodeTime_, 5.0f, 120.0f, "%.1f s");
+        ImGui::Text("Elapsed: %.2f / %.2f", trainingElapsed_, trainingEpisodeTime_);
+
+        ImGui::Separator();
+        ImGui::Text("Simulation");
+        ImGui::SliderFloat("Sim speed", &simSpeedMultiplier_, 0.1f, 10.0f, "%.1fx");
+        ImGui::SliderInt("Max substeps/frame", &maxSubstepsPerFrame_, 1, 128);
+
+        ImGui::Separator();
+        ImGui::Text("Sensors");
+        ImGui::Checkbox("Lidar enabled", &lidarEnabled_);
+        ImGui::Checkbox("Show lidar rays", &showLidarRays_);
+
+        ImGui::Separator();
+        ImGui::Text("Cars interaction");
+        int modeIdx = (interactionMode_ == CarInteractionMode::GHOSTS) ? 0 : 1;
+        const char* modeNames[] = { "Ghosts", "Collisions" };
+        if (ImGui::Combo("Mode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames))) {
+            interactionMode_ = (modeIdx == 0) ? CarInteractionMode::GHOSTS : CarInteractionMode::COLLISIONS;
+            rebuildCarCollisionMasks();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Spawn");
+        ImGui::Checkbox("Single-point training spawn", &trainingSpawnSinglePoint_);
+        ImGui::InputFloat2("Spawn pos", &trainingSpawnPos_.x);
+        ImGui::SliderFloat("Spawn yaw", &trainingSpawnYaw_, -3.14159f, 3.14159f, "%.2f");
+        ImGui::SliderFloat("Spawn jitter pos", &trainingSpawnJitterPos_, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Spawn jitter yaw", &trainingSpawnJitterYaw_, 0.0f, 0.5f, "%.3f");
+
+        ImGui::Separator();
+        ImGui::Text("Training gates");
+        ImGui::Checkbox("Auto build gates", &autoBuildTrainingGates_);
+        ImGui::Checkbox("Show training gates", &showTrainingGates_);
+        ImGui::SliderInt("Gate count", &trainingGateCount_, 4, 64);
+        ImGui::SliderFloat("Gate half width", &trainingGateHalfWidth_, 1.0f, 12.0f, "%.1f");
+        if (ImGui::Button("Rebuild gates")) {
+            rebuildSplineCache();
+            rebuildTrainingGates();
+        }
+        ImGui::Text("Built gates: %d", (int)trainingGates_.size());
+
+        ImGui::Separator();
+        ImGui::Text("Genetic");
+        ImGui::SliderInt("GA population", &gaPopulationSize_, 2, 64);
+        ImGui::SliderInt("GA elite", &gaEliteCount_, 1, 16);
+        ImGui::SliderInt("GA hidden", &gaHiddenSize_, 8, 64);
+        ImGui::SliderFloat("GA mutation sigma", &gaMutationSigma_, 0.01f, 0.5f, "%.3f");
+        ImGui::SliderFloat("GA mutation prob", &gaMutationProbability_, 0.01f, 0.5f, "%.3f");
+        ImGui::Text("Generation: %d", gaGeneration_);
+        ImGui::Text("Best gen fitness: %.3f", bestGenerationFitness_);
+        ImGui::Text("Best car: %d", bestGenerationCarIdx_);
+
+        if (ImGui::Button("Setup GA population")) setupGAPopulation();
+        ImGui::SameLine();
+        if (ImGui::Button("Save best genome")) saveBestGenome();
+
+        ImGui::Separator();
+        ImGui::TextDisabled("F9 start/stop | F10 reset episode | F11 lidar | F12 setup GA");
+
+        ImGui::End();
+    }
+
+    if (showAgentsWindow_ && trainingMode_ && !trainingCars_.empty()) {
+    ImGui::Begin("Training Agents", &showAgentsWindow_, ImGuiWindowFlags_None);
+
+    if (ImGui::BeginTable("training_agents_table", 8,
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY)) {
+
+        ImGui::TableSetupColumn("Car");
+        ImGui::TableSetupColumn("Type");
+        ImGui::TableSetupColumn("Fitness");
+        ImGui::TableSetupColumn("Lap");
+        ImGui::TableSetupColumn("NextGate");
+        ImGui::TableSetupColumn("Passed");
+        ImGui::TableSetupColumn("BadOrder");
+        ImGui::TableSetupColumn("Speed");
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < (int)cars.size(); ++i) {
+            if (i >= (int)trainingCars_.size()) continue;
+
+            const auto& st = trainingCars_[i];
+            float fit = (i < (int)trainingFitness_.size()) ? trainingFitness_[i] : 0.0f;
+            float spd = cars[i] ? std::abs(cars[i]->getSpeed()) * 3.6f : 0.0f;
+            const char* typeName = (i < (int)aiConfigs_.size())
+                ? controllerTypeName(aiConfigs_[i].type)
+                : "Unknown";
+
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            if (i == bestGenerationCarIdx_)
+                ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f), "#%d", i);
+            else
+                ImGui::Text("#%d", i);
+
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%s", typeName);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", fit);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%d", st.completedLaps);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%d", st.nextGateIndex);
+            ImGui::TableSetColumnIndex(5); ImGui::Text("%d", st.gatesPassedThisLap);
+            ImGui::TableSetColumnIndex(6); ImGui::Text("%d", st.invalidFinishAttempts);
+            ImGui::TableSetColumnIndex(7); ImGui::Text("%.1f", spd);
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::End();
+}
+
+    /* if (showHud) {
         ImGui::Begin("Training", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
         ImGui::Text("Episode");
@@ -1262,67 +1462,8 @@ void CarGame::render() {
         ImGui::TextDisabled("F9 start/stop | F10 reset episode | F11 lidar | F12 setup GA");
 
         ImGui::End();
-    }
+    } */
 
-    if (showHud && trainingMode_ && !trainingCars_.empty()) {
-        ImGui::Begin("Training Agents", nullptr, ImGuiWindowFlags_None);
-
-        if (ImGui::BeginTable("training_agents_table", 10,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
-            ImGuiTableFlags_ScrollY)) {
-
-            ImGui::TableSetupColumn("Car");
-            ImGui::TableSetupColumn("Type");
-            ImGui::TableSetupColumn("Fitness");
-            ImGui::TableSetupColumn("Pos01");
-            ImGui::TableSetupColumn("Lap");
-            ImGui::TableSetupColumn("dProg");
-            ImGui::TableSetupColumn("Dot");
-            ImGui::TableSetupColumn("WrongWay");
-            ImGui::TableSetupColumn("BadFinish");
-            ImGui::TableSetupColumn("Speed");
-            ImGui::TableHeadersRow();
-
-            for (int i = 0; i < (int)cars.size(); ++i) {
-                if (i >= (int)trainingCars_.size()) continue;
-
-                const auto& st = trainingCars_[i];
-                float fit = (i < (int)trainingFitness_.size()) ? trainingFitness_[i] : 0.0f;
-                float spd = cars[i] ? std::abs(cars[i]->getSpeed()) * 3.6f : 0.0f;
-                const char* typeName = (i < (int)aiConfigs_.size())
-                    ? controllerTypeName(aiConfigs_[i].type)
-                    : "Unknown";
-
-                ImGui::TableNextRow();
-
-                ImGui::TableSetColumnIndex(0);
-                if (i == bestGenerationCarIdx_)
-                    ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f), "#%d", i);
-                else
-                    ImGui::Text("#%d", i);
-
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%s", typeName);
-                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", fit);
-                ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", st.trackPos01);
-                ImGui::TableSetColumnIndex(4); ImGui::Text("%d", st.lapCount);
-                ImGui::TableSetColumnIndex(5); ImGui::Text("%.5f", st.validProgressDelta);
-                ImGui::TableSetColumnIndex(6); ImGui::Text("%.2f", st.trackForwardDot);
-
-                ImGui::TableSetColumnIndex(7);
-                if (st.wrongWay)
-                    ImGui::TextColored(ImVec4(1.0f,0.3f,0.3f,1.0f), "YES");
-                else
-                    ImGui::TextColored(ImVec4(0.4f,1.0f,0.4f,1.0f), "NO");
-
-                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", st.invalidFinishAttempts);
-                ImGui::TableSetColumnIndex(9); ImGui::Text("%.1f", spd);
-            }
-
-            ImGui::EndTable();
-        }
-
-    ImGui::End();
-}
 
     // ─── Окно "Cars" ──────────────────────────────────────────────────────────
     {
@@ -2273,6 +2414,37 @@ void CarGame::resetTrainingEpisode() {
     bestGenerationCarIdx_ = -1;
 
     if (telemetry) telemetry->reset();
+    for (auto& st : trainingCars_) {
+        st.nextGateIndex = 0;
+        st.gatesPassedThisLap = 0;
+        st.completedLaps = 0;
+        st.gateRewardProgress = 0.0f;
+    }
+}
+
+void CarGame::updateBestTrainingAgent() {
+    bestGenerationCarIdx_ = -1;
+    bestGenerationFitness_ = -1e30f;
+
+    auto better = [&](int a, int b) {
+        const auto& A = trainingCars_[a];
+        const auto& B = trainingCars_[b];
+
+        if (A.completedLaps != B.completedLaps) return A.completedLaps > B.completedLaps;
+        if (A.gatesPassedThisLap != B.gatesPassedThisLap) return A.gatesPassedThisLap > B.gatesPassedThisLap;
+        if (A.nextGateIndex != B.nextGateIndex) return A.nextGateIndex > B.nextGateIndex;
+        return trainingFitness_[a] > trainingFitness_[b];
+    };
+
+    for (int i = 0; i < (int)cars.size(); ++i) {
+        if (i >= (int)trainingFitness_.size()) continue;
+        if (i >= (int)trainingCars_.size()) continue;
+
+        if (bestGenerationCarIdx_ < 0 || better(i, bestGenerationCarIdx_)) {
+            bestGenerationCarIdx_ = i;
+            bestGenerationFitness_ = trainingFitness_[i];
+        }
+    }
 }
 
 void CarGame::updateTrainingCarState(int ci, const Observation& obs) {
@@ -2287,17 +2459,16 @@ void CarGame::updateTrainingCarState(int ci, const Observation& obs) {
 
     st.prevTrackPos01 = prev;
     st.trackPos01     = cur;
-    st.bestTrackPos01 = std::max(st.bestTrackPos01, cur);
 
     float dp = cur - prev;
     if (dp < -0.5f) dp += 1.0f;
     if (dp >  0.5f) dp -= 1.0f;
 
-    st.trackForwardDot = obs.trackForwardDot;
+    st.trackForwardDot  = obs.trackForwardDot;
     st.forwardAlignment = obs.trackForwardDot;
 
-    bool backwardByHeading  = (obs.trackForwardDot < -0.25f);
-    bool backwardByProgress = (dp < -1e-4f);
+    bool backwardByHeading  = (obs.trackForwardDot < -0.20f);
+    bool backwardByProgress = (dp < -0.0005f);
 
     if (backwardByHeading) st.wrongWayTime += STEP;
     else st.wrongWayTime = std::max(0.0f, st.wrongWayTime - STEP * 0.5f);
@@ -2305,20 +2476,143 @@ void CarGame::updateTrainingCarState(int ci, const Observation& obs) {
     if (backwardByProgress) st.reverseProgressTime += STEP;
     else st.reverseProgressTime = std::max(0.0f, st.reverseProgressTime - STEP * 0.5f);
 
-    st.wrongWay = (st.wrongWayTime > 0.35f) || (st.reverseProgressTime > 0.35f);
+    st.wrongWay = (st.wrongWayTime > 0.25f) || (st.reverseProgressTime > 0.25f);
+    if (st.wrongWay) st.everWrongWay = true;
 
-    st.validProgressDelta = (!st.wrongWay && dp > 0.0f) ? dp : 0.0f;
+    st.hardWrongWay =
+        (st.wrongWayTime > 0.60f) ||
+        (st.reverseProgressTime > 0.60f);
 
-    bool wrappedForward = (prev > 0.85f && cur < 0.15f);
-    bool wrappedBackwardCheat = (prev < 0.15f && cur > 0.85f);
+    bool wrappedForward      = (prev > 0.85f && cur < 0.15f);
+    bool wrappedBackwardHack = (prev < 0.15f && cur > 0.85f);
 
-    if (wrappedForward && !st.wrongWay && obs.trackForwardDot > 0.2f) {
+    if (wrappedBackwardHack || (wrappedForward && st.wrongWay)) {
+        st.invalidFinishAttempts += 1;
+    }
+
+    if (wrappedForward &&
+        !st.wrongWay &&
+        !st.everWrongWay &&
+        !st.disqualified &&
+        obs.trackForwardDot > 0.2f) {
         st.lapCount += 1;
         st.crossedFinishForward = true;
     }
 
-    if (wrappedBackwardCheat || (wrappedForward && st.wrongWay)) {
-        st.invalidFinishAttempts += 1;
+    // Общий прогресс = количество кругов + позиция на текущем круге
+    float totalProgress = (float)st.lapCount + cur;
+    st.bestTotalProgress = std::max(st.bestTotalProgress, totalProgress);
+    st.bestTrackPos01    = std::max(st.bestTrackPos01, cur);
+
+    // Награждать будем ТОЛЬКО за прирост frontier-а
+    st.validProgressDelta = 0.0f;
+    if (!st.wrongWay && !st.disqualified) {
+        float frontierGain = st.bestTotalProgress - st.rewardedProgress;
+        if (frontierGain > 1e-5f) {
+            st.validProgressDelta = frontierGain;
+            st.rewardedProgress = st.bestTotalProgress;
+            st.stuckTime = 0.0f;
+        } else {
+            st.stuckTime += STEP;
+        }
+    } else {
+        st.stuckTime += STEP;
+    }
+
+    // Кэмп около финиша / старта
+    bool nearFinishZone = (cur > 0.80f || cur < 0.08f);
+    if (nearFinishZone && obs.speedAbs < 2.0f) st.finishCampTime += STEP;
+    else st.finishCampTime = std::max(0.0f, st.finishCampTime - STEP);
+
+    // Жёсткая дисквалификация exploit-поведения
+    if (st.hardWrongWay ||
+        st.invalidFinishAttempts > 0 ||
+        st.finishCampTime > 1.5f ||
+        (nearFinishZone && st.stuckTime > 1.0f)) {
+        st.disqualified = true;
+    }
+}
+
+void CarGame::rebuildTrainingGates() {
+    trainingGates_.clear();
+    if (!track) return;
+
+    const std::vector<glm::vec2>& line =
+        (splineCache.size() >= 2) ? splineCache : track->racingLine;
+
+    const int N = (int)line.size();
+    if (N < 4) return;
+
+    int gateCount = std::clamp(trainingGateCount_, 4, std::max(4, N / 2));
+    trainingGates_.reserve(gateCount);
+
+    for (int gi = 0; gi < gateCount; ++gi) {
+        int idx = (gi * N) / gateCount;
+        int prev = (idx - 1 + N) % N;
+        int next = (idx + 1) % N;
+
+        glm::vec2 c = line[idx];
+        glm::vec2 tan = line[next] - line[prev];
+        float len = glm::length(tan);
+        if (len < 1e-5f) continue;
+        tan /= len;
+
+        glm::vec2 normal(-tan.y, tan.x);
+
+        TrainingGate g;
+        g.center = c;
+        g.a = c - normal * trainingGateHalfWidth_;
+        g.b = c + normal * trainingGateHalfWidth_;
+        trainingGates_.push_back(g);
+    }
+}
+
+bool CarGame::segmentIntersectsGate(const glm::vec2& p0, const glm::vec2& p1, const TrainingGate& g) const {
+    return segmentsIntersect2D(p0, p1, g.a, g.b);
+}
+
+void CarGame::updateTrainingGateProgress(int ci, const Observation& obs) {
+    if (ci < 0 || ci >= (int)trainingCars_.size()) return;
+    if (trainingGates_.empty()) return;
+
+    auto& st = trainingCars_[ci];
+
+    glm::vec2 prevPos = glm::vec2(0.0f);
+    if (cars[ci]) {
+        // Берём прошлую позицию через текущее положение минус оценку движения.
+        // Но надёжнее хранить prev pos отдельно. Если позже захочешь — вынесем в state.
+        float yaw = obs.yaw;
+        glm::vec2 forward(std::cos(yaw), std::sin(yaw));
+        prevPos = obs.pos - forward * obs.speedAbs * STEP;
+    } else {
+        prevPos = obs.pos;
+    }
+
+    int nextGate = st.nextGateIndex;
+    nextGate = std::clamp(nextGate, 0, (int)trainingGates_.size() - 1);
+
+    if (segmentIntersectsGate(prevPos, obs.pos, trainingGates_[nextGate])) {
+        st.nextGateIndex++;
+        st.gatesPassedThisLap++;
+        st.lastGateHitTime = trainingElapsed_;
+        st.gateRewardProgress += 1.0f;
+
+        if (st.nextGateIndex >= (int)trainingGates_.size()) {
+            st.nextGateIndex = 0;
+            st.gatesPassedThisLap = 0;
+            st.completedLaps++;
+            st.lapCount = st.completedLaps;
+            st.crossedFinishForward = true;
+        }
+    } else {
+        // Если пересёк "не тот" gate, можно слегка штрафовать
+        for (int gi = 0; gi < (int)trainingGates_.size(); ++gi) {
+            if (gi == nextGate) continue;
+            if (segmentIntersectsGate(prevPos, obs.pos, trainingGates_[gi])) {
+                st.invalidFinishAttempts += 1;
+                break;
+            }
+        }
     }
 }
 
