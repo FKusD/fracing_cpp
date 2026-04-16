@@ -803,46 +803,26 @@ void CarGame::update(float deltaTime) {
                 if (ci >= (int)trainingCars_.size())    trainingCars_.resize(cars.size());
 
                 auto& st = trainingCars_[ci];
-                st.crossedFinishForward = false;
 
                 updateTrainingGateProgress(ci, obs);
+                updateTrainingWallState(ci, obs);
 
                 float reward = 0.0f;
 
-                // Главное: reward только за новый корректный gate
-                float newGateProgress = st.gateRewardProgress;
-                if (newGateProgress > 0.0f) {
-                    reward += newGateProgress * 100.0f;
+                // Единственный позитивный сигнал: правильный следующий gate
+                if (st.gateRewardProgress > 0.0f) {
+                    // 1.0 = обычный gate, 11.0 = последний gate + lap bonus
+                    reward += st.gateRewardProgress * 100.0f;
                     st.gateRewardProgress = 0.0f;
                 }
 
-                // Большой бонус за завершение круга
-                if (st.crossedFinishForward) {
-                    reward += 1000.0f;
+                // Стены
+                if (st.justHitWall) {
+                    reward -= 20.0f;
                 }
-
-                // Небольшой бонус за движение, если не стоит
-                if (obs.speedAbs > 0.5f)
-                    reward += 0.01f;
-
-                // Off-track / wall-hugging
-                if (obs.offTrack)
-                    reward -= 0.10f;
-
-                float minRayAny = 1.0f;
-                for (int ri = 0; ri < Observation::kRayCount; ++ri)
-                    minRayAny = std::min(minRayAny, obs.rayDistance[ri]);
-
-                if (minRayAny < 0.03f)
-                    reward -= 0.40f;
-
-                // Если долго не проходит следующий gate — штраф
-                if ((trainingElapsed_ - st.lastGateHitTime) > 2.0f)
-                    reward -= 0.05f;
-
-                // Попытки перескочить не тот gate
-                if (st.invalidFinishAttempts > 0)
-                    reward -= 5.0f * (float)st.invalidFinishAttempts;
+                if (st.touchingWall) {
+                    reward -= 1.0f * STEP;
+                }
 
                 trainingFitness_[ci] += reward;
             }
@@ -1210,15 +1190,13 @@ void CarGame::render() {
                 const auto& st = trainingCars_[activeCarIndex];
                 ImGui::Separator();
                 ImGui::Text("Training state");
-                ImGui::Text("Track pos: %.4f", st.trackPos01);
-                ImGui::Text("Lap count: %d", st.lapCount);
-                ImGui::Text("Track dot: %.3f", st.trackForwardDot);
-                ImGui::Text("Valid dProg: %.5f", st.validProgressDelta);
-                ImGui::Text("Wrong way: %s", st.wrongWay ? "YES" : "NO");
-                ImGui::Text("Hard wrong-way: %s", st.hardWrongWay ? "YES" : "NO");
-                ImGui::Text("Ever wrong-way: %s", st.everWrongWay ? "YES" : "NO");
-                ImGui::Text("Disqualified: %s", st.disqualified ? "YES" : "NO");
-                ImGui::Text("Invalid finish attempts: %d", st.invalidFinishAttempts);
+                ImGui::Text("Completed laps: %d", st.completedLaps);
+                ImGui::Text("Next gate: %d", st.nextGateIndex);
+                ImGui::Text("Passed this lap: %d", st.gatesPassedThisLap);
+                ImGui::Text("Passed total: %d", st.gatesPassedTotal);
+                ImGui::Text("Touching wall: %s", st.touchingWall ? "YES" : "NO");
+                ImGui::Text("Just hit wall: %s", st.justHitWall ? "YES" : "NO");
+                ImGui::Text("Wall touch time: %.2f", st.wallTouchTime);
             }
         }
 
@@ -1345,6 +1323,13 @@ void CarGame::render() {
         ImGui::Text("Built gates: %d", (int)trainingGates_.size());
 
         ImGui::Separator();
+        ImGui::Text("Fitness rules:");
+        ImGui::BulletText("+100 next correct gate");
+        ImGui::BulletText("+1000 lap");
+        ImGui::BulletText("-20 wall hit");
+        ImGui::BulletText("-1 * dt while touching wall");
+
+        ImGui::Separator();
         ImGui::Text("Genetic");
         ImGui::SliderInt("GA population", &gaPopulationSize_, 2, 64);
         ImGui::SliderInt("GA elite", &gaEliteCount_, 1, 16);
@@ -1377,9 +1362,9 @@ void CarGame::render() {
         ImGui::TableSetupColumn("Fitness");
         ImGui::TableSetupColumn("Lap");
         ImGui::TableSetupColumn("NextGate");
-        ImGui::TableSetupColumn("Passed");
-        ImGui::TableSetupColumn("BadOrder");
-        ImGui::TableSetupColumn("Speed");
+        ImGui::TableSetupColumn("PassedLap");
+        ImGui::TableSetupColumn("PassedTotal");
+        ImGui::TableSetupColumn("Wall");
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < (int)cars.size(); ++i) {
@@ -1387,7 +1372,7 @@ void CarGame::render() {
 
             const auto& st = trainingCars_[i];
             float fit = (i < (int)trainingFitness_.size()) ? trainingFitness_[i] : 0.0f;
-            float spd = cars[i] ? std::abs(cars[i]->getSpeed()) * 3.6f : 0.0f;
+            // float spd = cars[i] ? std::abs(cars[i]->getSpeed()) * 3.6f : 0.0f;
             const char* typeName = (i < (int)aiConfigs_.size())
                 ? controllerTypeName(aiConfigs_[i].type)
                 : "Unknown";
@@ -1405,8 +1390,13 @@ void CarGame::render() {
             ImGui::TableSetColumnIndex(3); ImGui::Text("%d", st.completedLaps);
             ImGui::TableSetColumnIndex(4); ImGui::Text("%d", st.nextGateIndex);
             ImGui::TableSetColumnIndex(5); ImGui::Text("%d", st.gatesPassedThisLap);
-            ImGui::TableSetColumnIndex(6); ImGui::Text("%d", st.invalidFinishAttempts);
-            ImGui::TableSetColumnIndex(7); ImGui::Text("%.1f", spd);
+            ImGui::TableSetColumnIndex(6); ImGui::Text("%d", st.gatesPassedTotal);
+
+            ImGui::TableSetColumnIndex(7);
+            if (st.touchingWall)
+                ImGui::TextColored(ImVec4(1.0f,0.25f,0.25f,1.0f), "YES");
+            else
+                ImGui::TextColored(ImVec4(0.4f,1.0f,0.4f,1.0f), "NO");
         }
 
         ImGui::EndTable();
@@ -2119,6 +2109,18 @@ void CarGame::advanceGAGeneration() {
         return fa > fb;
     });
 
+    std::vector<int> parentPool;
+    for (int idx : ids) {
+        if (idx < (int)trainingCars_.size()) {
+            if (trainingCars_[idx].completedLaps > 0 || trainingCars_[idx].gatesPassedTotal >= 2) {
+                parentPool.push_back(idx);
+            }
+        }
+    }
+    if (parentPool.empty()) {
+        parentPool = ids;
+    }
+
     saveBestGenome();
 
     // ── D. Эволюция: элита + кроссовер + мутация ─────────────────────────────
@@ -2414,12 +2416,6 @@ void CarGame::resetTrainingEpisode() {
     bestGenerationCarIdx_ = -1;
 
     if (telemetry) telemetry->reset();
-    for (auto& st : trainingCars_) {
-        st.nextGateIndex = 0;
-        st.gatesPassedThisLap = 0;
-        st.completedLaps = 0;
-        st.gateRewardProgress = 0.0f;
-    }
 }
 
 void CarGame::updateBestTrainingAgent() {
@@ -2431,14 +2427,20 @@ void CarGame::updateBestTrainingAgent() {
         const auto& B = trainingCars_[b];
 
         if (A.completedLaps != B.completedLaps) return A.completedLaps > B.completedLaps;
-        if (A.gatesPassedThisLap != B.gatesPassedThisLap) return A.gatesPassedThisLap > B.gatesPassedThisLap;
-        if (A.nextGateIndex != B.nextGateIndex) return A.nextGateIndex > B.nextGateIndex;
+        if (A.gatesPassedTotal != B.gatesPassedTotal) return A.gatesPassedTotal > B.gatesPassedTotal;
         return trainingFitness_[a] > trainingFitness_[b];
     };
 
     for (int i = 0; i < (int)cars.size(); ++i) {
         if (i >= (int)trainingFitness_.size()) continue;
         if (i >= (int)trainingCars_.size()) continue;
+
+        // в элиту пускаем только тех, кто хотя бы немного реально ехал
+        bool validForElite =
+            (trainingCars_[i].completedLaps > 0) ||
+            (trainingCars_[i].gatesPassedTotal >= 2);
+
+        if (!validForElite) continue;
 
         if (bestGenerationCarIdx_ < 0 || better(i, bestGenerationCarIdx_)) {
             bestGenerationCarIdx_ = i;
@@ -2447,90 +2449,27 @@ void CarGame::updateBestTrainingAgent() {
     }
 }
 
-void CarGame::updateTrainingCarState(int ci, const Observation& obs) {
-    if (ci < 0 || ci >= (int)cars.size()) return;
-    if (ci >= (int)trainingCars_.size()) trainingCars_.resize(cars.size());
+void CarGame::updateTrainingWallState(int ci, const Observation& obs) {
+    if (ci < 0 || ci >= (int)trainingCars_.size()) return;
 
     auto& st = trainingCars_[ci];
-    st.crossedFinishForward = false;
+    st.justHitWall = false;
 
-    const float prev = st.trackPos01;
-    const float cur  = obs.progress;
-
-    st.prevTrackPos01 = prev;
-    st.trackPos01     = cur;
-
-    float dp = cur - prev;
-    if (dp < -0.5f) dp += 1.0f;
-    if (dp >  0.5f) dp -= 1.0f;
-
-    st.trackForwardDot  = obs.trackForwardDot;
-    st.forwardAlignment = obs.trackForwardDot;
-
-    bool backwardByHeading  = (obs.trackForwardDot < -0.20f);
-    bool backwardByProgress = (dp < -0.0005f);
-
-    if (backwardByHeading) st.wrongWayTime += STEP;
-    else st.wrongWayTime = std::max(0.0f, st.wrongWayTime - STEP * 0.5f);
-
-    if (backwardByProgress) st.reverseProgressTime += STEP;
-    else st.reverseProgressTime = std::max(0.0f, st.reverseProgressTime - STEP * 0.5f);
-
-    st.wrongWay = (st.wrongWayTime > 0.25f) || (st.reverseProgressTime > 0.25f);
-    if (st.wrongWay) st.everWrongWay = true;
-
-    st.hardWrongWay =
-        (st.wrongWayTime > 0.60f) ||
-        (st.reverseProgressTime > 0.60f);
-
-    bool wrappedForward      = (prev > 0.85f && cur < 0.15f);
-    bool wrappedBackwardHack = (prev < 0.15f && cur > 0.85f);
-
-    if (wrappedBackwardHack || (wrappedForward && st.wrongWay)) {
-        st.invalidFinishAttempts += 1;
+    float minRayAny = 1.0f;
+    for (int ri = 0; ri < Observation::kRayCount; ++ri) {
+        minRayAny = std::min(minRayAny, obs.rayDistance[ri]);
     }
 
-    if (wrappedForward &&
-        !st.wrongWay &&
-        !st.everWrongWay &&
-        !st.disqualified &&
-        obs.trackForwardDot > 0.2f) {
-        st.lapCount += 1;
-        st.crossedFinishForward = true;
+    bool nowTouchingWall = (minRayAny < 0.025f);
+
+    if (nowTouchingWall && !st.touchingWall) {
+        st.justHitWall = true;
     }
 
-    // Общий прогресс = количество кругов + позиция на текущем круге
-    float totalProgress = (float)st.lapCount + cur;
-    st.bestTotalProgress = std::max(st.bestTotalProgress, totalProgress);
-    st.bestTrackPos01    = std::max(st.bestTrackPos01, cur);
+    st.touchingWall = nowTouchingWall;
 
-    // Награждать будем ТОЛЬКО за прирост frontier-а
-    st.validProgressDelta = 0.0f;
-    if (!st.wrongWay && !st.disqualified) {
-        float frontierGain = st.bestTotalProgress - st.rewardedProgress;
-        if (frontierGain > 1e-5f) {
-            st.validProgressDelta = frontierGain;
-            st.rewardedProgress = st.bestTotalProgress;
-            st.stuckTime = 0.0f;
-        } else {
-            st.stuckTime += STEP;
-        }
-    } else {
-        st.stuckTime += STEP;
-    }
-
-    // Кэмп около финиша / старта
-    bool nearFinishZone = (cur > 0.80f || cur < 0.08f);
-    if (nearFinishZone && obs.speedAbs < 2.0f) st.finishCampTime += STEP;
-    else st.finishCampTime = std::max(0.0f, st.finishCampTime - STEP);
-
-    // Жёсткая дисквалификация exploit-поведения
-    if (st.hardWrongWay ||
-        st.invalidFinishAttempts > 0 ||
-        st.finishCampTime > 1.5f ||
-        (nearFinishZone && st.stuckTime > 1.0f)) {
-        st.disqualified = true;
-    }
+    if (st.touchingWall) st.wallTouchTime += STEP;
+    else st.wallTouchTime = 0.0f;
 }
 
 void CarGame::rebuildTrainingGates() {
@@ -2576,11 +2515,10 @@ void CarGame::updateTrainingGateProgress(int ci, const Observation& obs) {
     if (trainingGates_.empty()) return;
 
     auto& st = trainingCars_[ci];
+    st.gateRewardProgress = 0.0f;
 
     glm::vec2 prevPos = glm::vec2(0.0f);
     if (cars[ci]) {
-        // Берём прошлую позицию через текущее положение минус оценку движения.
-        // Но надёжнее хранить prev pos отдельно. Если позже захочешь — вынесем в state.
         float yaw = obs.yaw;
         glm::vec2 forward(std::cos(yaw), std::sin(yaw));
         prevPos = obs.pos - forward * obs.speedAbs * STEP;
@@ -2588,30 +2526,20 @@ void CarGame::updateTrainingGateProgress(int ci, const Observation& obs) {
         prevPos = obs.pos;
     }
 
-    int nextGate = st.nextGateIndex;
-    nextGate = std::clamp(nextGate, 0, (int)trainingGates_.size() - 1);
+    int nextGate = std::clamp(st.nextGateIndex, 0, (int)trainingGates_.size() - 1);
 
+    // Засчитываем ТОЛЬКО следующий ожидаемый gate
     if (segmentIntersectsGate(prevPos, obs.pos, trainingGates_[nextGate])) {
         st.nextGateIndex++;
         st.gatesPassedThisLap++;
-        st.lastGateHitTime = trainingElapsed_;
-        st.gateRewardProgress += 1.0f;
+        st.gatesPassedTotal++;
+        st.gateRewardProgress = 1.0f;
 
         if (st.nextGateIndex >= (int)trainingGates_.size()) {
             st.nextGateIndex = 0;
             st.gatesPassedThisLap = 0;
             st.completedLaps++;
-            st.lapCount = st.completedLaps;
-            st.crossedFinishForward = true;
-        }
-    } else {
-        // Если пересёк "не тот" gate, можно слегка штрафовать
-        for (int gi = 0; gi < (int)trainingGates_.size(); ++gi) {
-            if (gi == nextGate) continue;
-            if (segmentIntersectsGate(prevPos, obs.pos, trainingGates_[gi])) {
-                st.invalidFinishAttempts += 1;
-                break;
-            }
+            st.gateRewardProgress += 10.0f; // бонус за круг через gateRewardProgress
         }
     }
 }
@@ -2752,7 +2680,7 @@ void CarGame::addAICar() {
     cars.push_back(std::move(c));
     carIsAI.push_back(true);
 
-    static uint32_t aiSeed = 42;
+    // static uint32_t aiSeed = 42;
     aiControllers.push_back(nullptr);//std::make_unique<RandomController>(aiSeed++));
     aiWaypointIndex.push_back(0);
 

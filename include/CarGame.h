@@ -72,35 +72,15 @@ private:
     };
 
     struct TrainingCarState {
-        float trackPos01 = 0.0f;
-        float prevTrackPos01 = 0.0f;
-
-        float forwardAlignment = 0.0f;
-        float trackForwardDot = 0.0f;
-        float validProgressDelta = 0.0f;
-        float bestTrackPos01 = 0.0f;
-
-        float wrongWayTime = 0.0f;
-        float reverseProgressTime = 0.0f;
-
-        int lapCount = 0;
-        int invalidFinishAttempts = 0;
-
-        bool wrongWay = false;
-        bool crossedFinishForward = false;
-        bool hardWrongWay = false;
-        bool everWrongWay = false;
-        bool disqualified = false;
-
-        float bestTotalProgress = 0.0f;     // лучший достигнутый общий прогресс: круги + позиция
-        float rewardedProgress  = 0.0f;     // до какого общего прогресса уже выдавали награду
-        float stuckTime         = 0.0f;     // время без нового честного прогресса
-        float finishCampTime    = 0.0f;     // время зависания около финиша
-
         int nextGateIndex = 0;
         int gatesPassedThisLap = 0;
+        int gatesPassedTotal = 0;
         int completedLaps = 0;
-        float lastGateHitTime = 0.0f;
+
+        bool touchingWall = false;
+        bool justHitWall = false;
+        float wallTouchTime = 0.0f;
+
         float gateRewardProgress = 0.0f;
     };
 
@@ -108,7 +88,8 @@ private:
     float bestGenerationFitness_ = -1e30f;
     int bestGenerationCarIdx_ = -1;
 
-    void updateTrainingCarState(int carIdx, const Observation& obs);
+    // void updateTrainingCarState(int carIdx, const Observation& obs);
+    void updateTrainingWallState(int carIdx, const Observation& obs);
     void updateBestTrainingAgent();
 
     CarInteractionMode interactionMode_ = CarInteractionMode::COLLISIONS;
